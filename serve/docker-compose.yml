@@ -77,6 +77,13 @@ services:
   t2v:
     <<: *common
     container_name: fasth3-t2v
+    environment:
+      <<: *common_env
+      # Dense prefix: the text and audio prefix queries (against every key) and the prefix keys (for every other query)
+      # run as two dense FlashAttention-4 calls in BF16; the sparse kernel keeps only the selected video tiles and an LSE
+      # merge joins them. Long prompts: 10K tokens -16% (5 s clip), 1K -2%; short prompts unchanged. 0 = off.
+      # The fast / max profiles keep the prefix in their 8-bit sparse kernel (it has no LSE output).
+      FASTVIDEO_H3_DENSE_PREFIX: ${T2V_DENSE_PREFIX-bf16}
     entrypoint: ["sh", "-c", "/opt/venv/bin/fastvideo serve --config /config/fasth3-8step.yaml $$FV_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3 ) & wait $$s"]
 
   omni:

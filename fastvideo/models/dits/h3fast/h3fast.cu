@@ -265,14 +265,15 @@ __global__ void __launch_bounds__(C / 8) resid_norm_quant(const bf16* __restrict
 }
 
 // One CTA per (tile, head): per-head q/k RMSNorm, partial RoPE, row scale, heads-first padded output, tile means.
-template <int NWARP>
+// CC: also write q/k/v to compact BSHD copies (qc/kc/vc [rows, heads, D]) for the dense prefix passes on FA4.
+template <int NWARP, bool CC>
 __global__ void __launch_bounds__(NWARP * 32) qkv_prologue(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v, int64_t ld,
     const float* __restrict__ s1, const int* __restrict__ tile_row0, const int* __restrict__ vbs,
     const bf16* __restrict__ wq, const bf16* __restrict__ wk, const bf16* __restrict__ cosb,
     const bf16* __restrict__ sinb, bf16* __restrict__ qb, bf16* __restrict__ kb, bf16* __restrict__ vb,
     float* __restrict__ qp, float* __restrict__ kp, float* __restrict__ vp, int heads, int64_t rows_pad, int n_tiles,
-    int tile, float eps) {
+    int tile, float eps, bf16* __restrict__ qc, bf16* __restrict__ kc, bf16* __restrict__ vc) {
   constexpr int D = 128, ROT = 96, HALF_LANES = 12;
   __shared__ float sp[3][NWARP][D];
   const int h = blockIdx.x % heads, ti = blockIdx.x / heads;
@@ -324,6 +325,12 @@ __global__ void __launch_bounds__(NWARP * 32) qkv_prologue(
     st4(qb + dst, qo);
     st4(kb + dst, ko);
     st4(vb + dst, vf);
+    if constexpr (CC) {
+      const size_t cdst = ((size_t)(row0 + i) * heads + h) * D + l * 4;
+      st4(qc + cdst, qo);
+      st4(kc + cdst, ko);
+      st4(vc + cdst, vf);
+    }
   };
   for (int i = w; i < n; i += 2 * NWARP) {
     const int i2 = i + NWARP;
@@ -702,7 +709,8 @@ __global__ void __launch_bounds__(W / 8) attn_gate_quant(const bf16* __restrict_
     ld8(o1 + ((size_t)r * H + h) * D + d0, od);
     const float l1 = (r < n1 ? lse1a[(size_t)h * n1 + r] : lse1b[(size_t)h * (gridDim.x - n1) + (r - n1)]) *
                      1.4426950408889634f;
-    const float l2 = lse2[(size_t)h * rows_pad + sl];
+    // prefix rows select no sparse keys (split lists), so whatever the sparse kernel left there is ignored
+    const float l2 = r < n1 ? -INFINITY : lse2[(size_t)h * rows_pad + sl];
     const float m = fmaxf(l1, l2);
     const float w1 = m == -INFINITY ? 0.f : exp2f(l1 - m), w2 = m == -INFINITY ? 0.f : exp2f(l2 - m);
     const float inv = (w1 + w2) > 0.f ? 1.f / (w1 + w2) : 0.f;
@@ -829,14 +837,21 @@ void resid_norm_quant_op(torch::Tensor x, std::optional<torch::Tensor> y, std::o
 void qkv_prologue_op(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor s1, torch::Tensor tile_row0,
                      torch::Tensor vbs, torch::Tensor wq, torch::Tensor wk, torch::Tensor cosb, torch::Tensor sinb,
                      torch::Tensor qb, torch::Tensor kb, torch::Tensor vb, torch::Tensor qp, torch::Tensor kp,
-                     torch::Tensor vp, int64_t heads, int64_t n_tiles, int64_t tile, double eps) {
+                     torch::Tensor vp, int64_t heads, int64_t n_tiles, int64_t tile, double eps,
+                     std::optional<torch::Tensor> qc, std::optional<torch::Tensor> kc, std::optional<torch::Tensor> vc) {
   const at::cuda::OptionalCUDAGuard guard(device_of(q));
   auto stream = at::cuda::getCurrentCUDAStream();
   TORCH_CHECK(cosb.size(-1) == 96 && sinb.size(-1) == 96);
-  qkv_prologue<8><<<n_tiles * heads, 256, 0, stream>>>(
-      ptr<bf16>(q), ptr<bf16>(k), ptr<bf16>(v), q.stride(0), ptr<float>(s1), ptr<int>(tile_row0), ptr<int>(vbs),
-      ptr<bf16>(wq), ptr<bf16>(wk), ptr<bf16>(cosb), ptr<bf16>(sinb), ptr<bf16>(qb), ptr<bf16>(kb), ptr<bf16>(vb),
-      ptr<float>(qp), ptr<float>(kp), ptr<float>(vp), (int)heads, qb.size(-2), (int)n_tiles, (int)tile, (float)eps);
+  TORCH_CHECK(qc.has_value() == kc.has_value() && kc.has_value() == vc.has_value());
+  auto launch = [&](auto cc) {
+    qkv_prologue<8, decltype(cc)::value><<<n_tiles * heads, 256, 0, stream>>>(
+        ptr<bf16>(q), ptr<bf16>(k), ptr<bf16>(v), q.stride(0), ptr<float>(s1), ptr<int>(tile_row0), ptr<int>(vbs),
+        ptr<bf16>(wq), ptr<bf16>(wk), ptr<bf16>(cosb), ptr<bf16>(sinb), ptr<bf16>(qb), ptr<bf16>(kb), ptr<bf16>(vb),
+        ptr<float>(qp), ptr<float>(kp), ptr<float>(vp), (int)heads, qb.size(-2), (int)n_tiles, (int)tile, (float)eps,
+        qc ? ptr<bf16>(*qc) : nullptr, kc ? ptr<bf16>(*kc) : nullptr, vc ? ptr<bf16>(*vc) : nullptr);
+  };
+  if (qc) launch(std::true_type{});
+  else launch(std::false_type{});
 }
 
 void qkv_prologue8_op(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor s1, torch::Tensor tile_row0,

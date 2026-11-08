@@ -4,15 +4,15 @@ A single-GPU inference path for [FastH3](https://huggingface.co/FastVideo/FastVi
 8-step distillation of MiniMax-H3 (text to 1344×768 video with synchronized stereo audio), built for the NVIDIA GB300
 in a DGX Station and served through FastVideo's OpenAI-style video API.
 
-On one GB300, a 5-second 1344×768 clip with audio takes **11.65 s** from request to finished MP4, at the
+On one GB300, a 5-second 1344×768 clip with audio takes **11.57 s** from request to finished MP4, at the
 quality of FastVideo's own FP8 path. FastVideo with all of its speed options takes 17.32 s on the same GPU, and
 34.59 s out of the box. The lossy profiles go down to **7.44 s**. FastH3 Omni (text plus image, video or audio
 references) takes 19.83 s per 5-second clip, down to 16.23 s.
 
 The repository is a patch over [FastVideo](https://github.com/hao-ai-lab/FastVideo) at commit `a01c50a`: a fused DiT
 block path with its own CUDA kernels (`fastvideo/models/dits/h3fast/`), 8-bit block-sparse attention kernels derived
-from FastVideo's Blackwell VSA kernel, a dense-prefix attention path for Omni on FlashAttention-4, and a faster output
-tail. Model weights are FastVideo's, unchanged.
+from FastVideo's Blackwell VSA kernel, a dense path on FlashAttention-4 for the prompt and reference prefix, and a
+faster output tail. Model weights are FastVideo's, unchanged.
 
 - [Results](#results): presets, the same GPU under other engines, published numbers from other systems
 - [How it is served](#how-it-is-served): every setting, and why
@@ -22,8 +22,8 @@ tail. Model weights are FastVideo's, unchanged.
 
 ## Results
 
-All numbers: one GB300, one request at a time, server warmed up, median of the timed clips (6 per preset, 3 for 10 s
-and 15 s clips and long prompts) after one untimed clip. Unless a row says otherwise: 1344×768, 124 frames at 24 fps
+All numbers: one GB300, one request at a time, server warmed up, median of the timed clips (6 per preset at 5 s, 3 with
+long prompts, 2 for 10 s and 15 s clips) after one untimed clip. Unless a row says otherwise: 1344×768, 124 frames at 24 fps
 (5.17 s), 8 transformer forwards, short prompts (12-16 words), seed 1234. "End to end" runs from the API request to the
 finished MP4 (H.264 + AAC) on disk. "Denoise" is the 8 transformer forwards. Conditions in full:
 [Benchmark conditions](#benchmark-conditions).
@@ -35,7 +35,7 @@ sets size and length. End to end, 1344×768, short prompts:
 
 | Preset | Linears | Attention | 5 s (124 frames) | 10 s (243) | 15 s (362) | Quality (video / audio) |
 |---|---|---|---:|---:|---:|---|
-| Default | FP8 | BF16 | 11.65 s | 28.66 s | 54.71 s | 0.191 / 0.068 |
+| Default | FP8 | BF16 | 11.57 s | 28.66 s | 54.71 s | 0.191 / 0.068 |
 | `fast` | FP8 | BF16 QK^T, E4M3 PV | 10.80 s | 25.44 s | 47.14 s | 0.197 / 0.075 |
 | `qad-nvfp4` | NVFP4 (QAD) | BF16 QK^T, E4M3 PV | 8.37 s | 20.78 s | 39.98 s | 0.271 / 0.158 |
 | `max` | NVFP4 (QAD) | E4M3 | 7.44 s | 17.86 s | 33.75 s | 0.282 / 0.167 |
@@ -52,19 +52,20 @@ weights distilled from the same model, so their error includes that model's dist
 changes only the video decoder (see [How it is served](#how-it-is-served)). Omni rows carry one 1344×768 reference image,
 encoded on every clip.
 
-Other sizes and prompt lengths:
+Other sizes and prompt lengths (long prompts: teacher-forced error against BF16 with the 1K-token prompt 0.243 /
+0.082 and with the 10K-token prompt 0.256 / 0.062; the dense text prefix of 1.1 moved it by less than 0.003):
 
 | Preset | Request | End to end |
 |---|---|---:|
 | Default | 832×480, 5 s | 4.01 s |
 | Default | 768×1344 (portrait), 5 s | 11.81 s |
 | Default | 640×640 (ComfyUI template's size), 5 s | 3.79 s |
-| Default | 5 s, 1K-token prompt | 12.86 s |
-| Default | 10 s, 1K-token prompt | 30.55 s |
-| Default | 15 s, 1K-token prompt | 56.52 s |
-| Default | 5 s, 10K-token prompt | 24.25 s |
-| Default | 10 s, 10K-token prompt | 48.55 s |
-| Default | 15 s, 10K-token prompt | 83.46 s |
+| Default | 5 s, 1K-token prompt | 12.41 s |
+| Default | 10 s, 1K-token prompt | 29.90 s |
+| Default | 15 s, 1K-token prompt | 55.48 s |
+| Default | 5 s, 10K-token prompt | 20.08 s |
+| Default | 10 s, 10K-token prompt | 42.38 s |
+| Default | 15 s, 10K-token prompt | 73.25 s |
 | `fast` | 832×480, 5 s | 3.86 s |
 | `qad-nvfp4` | 832×480, 5 s | 2.92 s |
 | `max` | 832×480, 5 s | 2.71 s |
@@ -87,7 +88,7 @@ The same model and requests on the same GB300 with FastVideo alone, end to end (
 |---|---|---:|---:|---:|---:|
 | FastVideo `a01c50a`, out of the box | BF16 transformer, no compile, FastVideo's defaults (full VAE decoder, 8 tiles per decoder call); its image with only the FlashInfer import fixed | 34.59 s | 78.81 s | 137.3 s | 11.87 s |
 | FastVideo `a01c50a`, all of its speed options | FP8 linears, compiled VAE, its fused kernels (`FUSIONS=mk`), tile-first tcgen05 VSA, FlashAttention-4 + NVFP4 quality decoder + 28 tiles per call in the VAE | 17.32 s | 40.26 s | 73.75 s | 6.14 s |
-| This repository, default | FP8 linears, BF16 attention | 11.65 s | 28.66 s | 54.71 s | 4.01 s |
+| This repository, default | FP8 linears, BF16 attention | 11.57 s | 28.66 s | 54.71 s | 4.01 s |
 | This repository, `max` | QAD NVFP4 linears, E4M3 attention | 7.44 s | 17.86 s | 33.75 s | 2.71 s |
 
 ### Published numbers from other systems
@@ -98,25 +99,25 @@ re-measured here; GPU counts and models differ (FastH3 V2 unless noted).
 
 | System | GPUs | Precision | Clip | Timed span | Published | This repo, 1× GB300 (default FP8 / `max` NVFP4) |
 |---|---|---|---|---|---:|---:|
-| UniServe (FastVideo) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 5.62 s | 12.88 s / 8.12 s |
-| UniServe (FastVideo) | 4× GB200 | NVFP4 MLP + decoder | 5 s, 1K-token prompt | request → MP4 downloaded | 4.49 s | 12.88 s / 8.12 s |
-| FastVideo (UniServe's tuned baseline) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 7.47 s | 12.88 s / 8.12 s |
-| SGLang (UniServe's tuned baseline) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 7.07 s | 12.88 s / 8.12 s |
-| vLLM-Omni (UniServe's tuned baseline) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 7.69 s | 12.88 s / 8.12 s |
-| UniServe (FastVideo) | 8× GB200 (2 nodes) | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 3.13 s | 12.88 s / 8.12 s |
-| UniServe (FastVideo) | 4× GB200 | BF16 | 5 s, 10K-token prompt | request → MP4 downloaded | 8.80 s | 24.26 s / - |
-| UniServe (FastVideo) | 4× GB200 | BF16 | 10 s, 1K-token prompt | request → MP4 downloaded | 11.73 s | 30.57 s / 18.92 s |
-| UniServe (FastVideo) | 4× GB200 | BF16 | 15 s, 1K-token prompt | request → MP4 downloaded | 20.27 s | 56.55 s / 35.05 s |
-| UniServe (FastVideo) | 4× GB200 | BF16 | 10 s, 10K-token prompt | request → MP4 downloaded | 16.75 s | 48.58 s / - |
-| UniServe (FastVideo) | 4× GB200 | BF16 | 15 s, 10K-token prompt | request → MP4 downloaded | 27.31 s | 83.50 s / - |
-| UniServe (FastVideo) | 8× RTX PRO 6000 Server | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 19.12 s | 12.88 s / 8.12 s |
-| Sol-H3 (NVIDIA), 4 forwards, dense | 1× B300 | not stated | 5 s (124 frames) | text encoding → VAE decode, no MP4 | 11.48 s | 11.47 s / 7.26 s |
+| UniServe (FastVideo) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 5.62 s | 12.42 s / 8.12 s |
+| UniServe (FastVideo) | 4× GB200 | NVFP4 MLP + decoder | 5 s, 1K-token prompt | request → MP4 downloaded | 4.49 s | 12.42 s / 8.12 s |
+| FastVideo (UniServe's tuned baseline) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 7.47 s | 12.42 s / 8.12 s |
+| SGLang (UniServe's tuned baseline) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 7.07 s | 12.42 s / 8.12 s |
+| vLLM-Omni (UniServe's tuned baseline) | 4× GB200 | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 7.69 s | 12.42 s / 8.12 s |
+| UniServe (FastVideo) | 8× GB200 (2 nodes) | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 3.13 s | 12.42 s / 8.12 s |
+| UniServe (FastVideo) | 4× GB200 | BF16 | 5 s, 10K-token prompt | request → MP4 downloaded | 8.80 s | 20.09 s / - |
+| UniServe (FastVideo) | 4× GB200 | BF16 | 10 s, 1K-token prompt | request → MP4 downloaded | 11.73 s | 29.93 s / 18.92 s |
+| UniServe (FastVideo) | 4× GB200 | BF16 | 15 s, 1K-token prompt | request → MP4 downloaded | 20.27 s | 55.51 s / 35.05 s |
+| UniServe (FastVideo) | 4× GB200 | BF16 | 10 s, 10K-token prompt | request → MP4 downloaded | 16.75 s | 42.41 s / - |
+| UniServe (FastVideo) | 4× GB200 | BF16 | 15 s, 10K-token prompt | request → MP4 downloaded | 27.31 s | 73.28 s / - |
+| UniServe (FastVideo) | 8× RTX PRO 6000 Server | BF16 | 5 s, 1K-token prompt | request → MP4 downloaded | 19.12 s | 12.42 s / 8.12 s |
+| Sol-H3 (NVIDIA), 4 forwards, dense | 1× B300 | not stated | 5 s (124 frames) | text encoding → VAE decode, no MP4 | 11.48 s | 11.40 s / 7.26 s |
 | Sol-H3 (NVIDIA), 4 forwards, dense | 1× B300 | not stated | 10 s (243 frames) | text encoding → VAE decode, no MP4 | 28.18 s | 28.41 s / 17.59 s |
 | Sol-H3 (NVIDIA), 4 forwards, dense | 1× B300 | not stated | 15 s (362 frames) | text encoding → VAE decode, no MP4 | 50.71 s | 54.38 s / 33.39 s |
-| Sol-H3 (NVIDIA), 4 forwards, sparse | 8× B300 | INT8 QKV, FP8 transport | 5 s (124 frames) | text encoding → VAE decode, no MP4 | 1.65 s | 11.47 s / 7.26 s |
-| ComfyUI 0.37, official template | 1× RTX 5090 | NVFP4 | 5 s, text to video | submit → MP4 saved | 50.8-52.8 s | 11.65 s / 7.44 s |
+| Sol-H3 (NVIDIA), 4 forwards, sparse | 8× B300 | INT8 QKV, FP8 transport | 5 s (124 frames) | text encoding → VAE decode, no MP4 | 1.65 s | 11.40 s / 7.26 s |
+| ComfyUI 0.37, official template | 1× RTX 5090 | NVFP4 | 5 s, text to video | submit → MP4 saved | 50.8-52.8 s | 11.57 s / 7.44 s |
 | ComfyUI 0.37, official template | 1× RTX 5090 | NVFP4 | 832×480, 5 s, text to video | submit → MP4 saved | 18.7 s | 4.01 s / 2.71 s |
-| FastVideo engine (FastVideo's figures) | 1× RTX 5090 | not stated | 5 s | text encoding → MP4 | 38.6 s | 11.65 s / 7.44 s |
+| FastVideo engine (FastVideo's figures) | 1× RTX 5090 | not stated | 5 s | text encoding → MP4 | 38.6 s | 11.57 s / 7.44 s |
 | FastVideo engine (FastVideo's figures) | 1× RTX 5090 | not stated | 832×480, 5 s | text encoding → MP4 | 14.8 s | 4.01 s / 2.71 s |
 
 Sources: [UniServe](https://haoailab.com/blogs/uniserve-fasth3/) (FastVideo's serving stack; BF16 unless noted, its
@@ -135,7 +136,7 @@ its latency; over an equal mix of the same six shapes:
 | UniServe (FastVideo), BF16 | 4× GB200 | ~6,100 | 5.8 |
 | UniServe (FastVideo), BF16 | 8× GB200 | ~11,000 | 6.4 |
 | UniServe (FastVideo), BF16 | 8× RTX PRO 6000 Server | ~3,400 | 21.2 |
-| This repository, default (FP8) | 1× GB300 | 2,023 | 4.2 |
+| This repository, default (FP8) | 1× GB300 | 2,220 | 3.8 |
 
 ### Benchmark conditions
 
@@ -181,7 +182,7 @@ Output: MP4 with H.264 (libx264, preset ultrafast, yuv420p) and AAC (32 kHz ster
 |---|---|---|
 | Transformer linears | FP8 E4M3: weights per tensor (quantized at load), activations per row | `qad-nvfp4` and `max` profiles: FastVideo's quantization-aware NVFP4 checkpoint (FastH3-QAD-v2), W4A4 |
 | Attention | BF16 on FastVideo's tcgen05 VSA kernel | `FASTVIDEO_H3_FP8_ATTN=pv`: BF16 QK^T + E4M3 PV; `=1`: E4M3 QK^T and PV |
-| Omni prefix attention | dense on FlashAttention-4 (BF16), merged with the sparse rest | `omni-fast`, `omni-max`: E4M3 |
+| Prefix attention (text, audio and reference rows) | dense on FlashAttention-4 (BF16), merged with the sparse rest by log-sum-exp | `omni-fast`, `omni-max`: E4M3; t2v `fast` / `max` / `preview` keep the prefix in their 8-bit sparse kernel |
 | Tile selection scores | TF32 | `FASTVIDEO_H3_TF32_SCORES=0`: fp32 |
 | Text encoder | H3's Qwen3-VL 32B, BF16; FA2 attention (t2v), cuDNN (Omni) | |
 | Video decoder | FastVideo's NVFP4 quality decoder (36 layers; 37.9 dB / LPIPS 0.010 against the FP32 decoder on FastH3 V2 clips, per its model card), all 28 spatial tiles of a frame chunk per call, FlashAttention-4 attention, `torch.compile` with CUDA graphs | `preview`: the 8-layer fast tier (28.5 dB / 0.068) |
@@ -235,7 +236,7 @@ sparsity 0.9 raised the teacher-forced error from 0.194 / 0.071 to 0.284 / 0.089
 
 For timing on a regular PC: a published run of the ComfyUI template on an RTX 5090 (ComfyUI 0.37, NVFP4 V2 file,
 1344×768, 124 frames, text to video) took 50.8-52.8 s from submit to saved file, and 18.7 s at 832×480. FastVideo's own
-engine on the same card: 38.6 s and 14.8 s. This server on a GB300: 11.65 s and 4.01 s with the default
+engine on the same card: 38.6 s and 14.8 s. This server on a GB300: 11.57 s and 4.01 s with the default
 profile, 7.44 s and 2.71 s with `max`.
 
 ## What makes it fast
@@ -252,6 +253,7 @@ Measured on t2v (5 s, 1344×768) unless noted; each step on top of the previous 
 | **8-bit attention kernels** (`h3fast/vsa_fp8.cuh`): FastVideo's warp-specialized tcgen05 VSA kernel with `kind::f8f6f4` MMAs; Q and K with static per-layer scales from the RMSNorm bound, V with one scale per (tile, head) folded into P's exponent; hardware `ex2` (Blackwell Ultra doubles the SFU rate) and the sm_103 `tcgen05.ld.red` row max | kernel 10.7 → 6.7 ms (all E4M3); profiles `fast` / `max` | SageAttention (per-block 8-bit attention); FlashAttention-4 (`ld.red` row max, no exp emulation on sm_103) |
 | **Omni: 128-token pair kernel** (`h3fast/vsa_pair.cuh`): two 64-row query tiles on full-rate M=128 MMAs with per-row membership masks, E4M3 PV | Omni 23.9 → 21.0 s | FlashAttention-4's two-query-tile CTAs; MC-Sparse's query grouping |
 | **Omni: dense prefix on FlashAttention-4**: the reference/text prefix queries (against all keys) and the prefix keys (for all other queries) run as two dense FA4 calls; the sparse kernel keeps only the selected video tiles; a log-sum-exp merge in the gate kernel joins them | Omni 20.4 → 18.6 s with *lower* error (BF16 dense part); 15.3 s with E4M3 | FlashAttention-4 (dense kernel with LSE output); Fireworks' KV-stationary sparse-attention write-up (hot KV blocks) |
+| **Dense text prefix for t2v** (1.1): the same split for the prompt's text and the audio rows, with FastVideo's BF16 sparse kernel returning its log-sum-exp for the merge | 5 s clip with a 10K-token prompt 24.0 → 20.1 s, 15 s 83.1 → 73.3 s; 1K-token prompt −2%; short prompts unchanged | |
 
 FastVideo's own options are also on: its tcgen05 VSA kernel, batched VAE tiles (all 28 tiles per call), the NVFP4
 quality decoder, FP8 linears and the compiled VAE.

@@ -88,15 +88,19 @@ class H3FastRunner:
         # 128-token tiles (Omni) with FP8 attention run on the M=128 pair kernel (E4M3 PV); BF16 stays on the stock
         # blk128 kernel, which is faster than the pair kernel's BF16 build.
         self.pair128 = self.fp8_attn
-        # 128-token tiles with an exempt prefix: the prefix queries (against every key) and the prefix keys (for every
-        # other query) as two dense FA4 calls, BF16 or E4M3 (Q/K static scales, V one scale per head); the pair kernel
-        # keeps only the selected video tiles, and an LSE merge in the gate kernel joins the two.
+        # Layouts with an exempt prefix (text, audio, references): the prefix queries (against every key) and the prefix
+        # keys (for every other query) as two dense FA4 calls, BF16 or E4M3 (Q/K static scales, V one scale per head);
+        # the sparse kernel keeps only the selected video tiles and returns its LSE, and an LSE merge in the gate kernel
+        # joins the two. Sparse kernels with an LSE: the stock BF16 ones (64- and 128-token tiles) and the 128-token
+        # pair kernel; the 64-token 8-bit kernel has none, so that route keeps the prefix in the sparse pass. On when
+        # the prefix has at least FASTVIDEO_H3_DENSE_PREFIX_MIN_ROWS rows (long prompts, references).
         self.dense_prefix = os.environ.get("FASTVIDEO_H3_DENSE_PREFIX", "0")
         if self.dense_prefix not in ("0", "bf16", "fp8"):
             raise ValueError(f"FASTVIDEO_H3_DENSE_PREFIX={self.dense_prefix!r}: expected 0, bf16 or fp8")
-        if self.dense_prefix != "0" and not self.fp8_attn:
-            logger.warning("FASTVIDEO_H3_DENSE_PREFIX needs FASTVIDEO_H3_FP8_ATTN (pv or 1); ignored")
-            self.dense_prefix = "0"
+        if self.dense_prefix == "fp8" and not self.fp8_attn:
+            logger.warning("FASTVIDEO_H3_DENSE_PREFIX=fp8 needs FASTVIDEO_H3_FP8_ATTN (pv or 1); using bf16")
+            self.dense_prefix = "bf16"
+        self.dense_prefix_min_rows = int(os.environ.get("FASTVIDEO_H3_DENSE_PREFIX_MIN_ROWS", "0"))
         # TF32 for the two small fp32 matmuls on tile means (scores for the top-k, compressed branch): 0.29 -> 0.06 ms
         # per block. Selection can move at near-ties (the stock path scores in fp32); the teacher-forced error vs BF16
         # did not go up (0.194 / 0.071 -> 0.191 / 0.068). "0" keeps fp32.
@@ -177,9 +181,11 @@ class H3FastRunner:
             buffers["umem"] = torch.full((1, heads, n_ext, 2 * n_tiles), 3, device=device, dtype=torch.uint8)
             buffers["unum"] = torch.zeros(1, heads, n_ext, device=device, dtype=torch.int32)
             buffers["vbs64"] = torch.stack([vbs_ext.clamp(max=64), (vbs_ext - 64).clamp(min=0)], -1).flatten().contiguous()
-        n_pre = 0
-        if self.dense_prefix != "0" and tile == 128 and self.pair128 and meta.num_prefix_tiles > 0:
-            n_pre = int(vbs[:meta.num_prefix_tiles].sum().item())
+        n_pre = int(vbs[:meta.num_prefix_tiles].sum().item()) if meta.num_prefix_tiles > 0 else 0
+        lse_route = (tile == 128 and self.pair128) or not self.fp8_attn
+        if self.dense_prefix == "0" or not lse_route or n_pre == 0 or n_pre < self.dense_prefix_min_rows:
+            n_pre = 0
+        if n_pre:
             qk = torch.bfloat16 if self.dense_prefix == "bf16" else _FP8
             buffers["qc"] = e(rows, heads, dim, d=qk)
             buffers["kc"] = e(rows, heads, dim, d=qk)
@@ -189,7 +195,8 @@ class H3FastRunner:
             buffers["o1"] = e(1, rows, heads, dim)
             buffers["lse1a"] = e(1, heads, n_pre, d=torch.float32)
             buffers["lse1b"] = e(1, heads, rows - n_pre, d=torch.float32)
-            buffers["lse2"] = e(1, heads, rows_pad, d=torch.float32)
+            if self.pair128 and tile == 128:
+                buffers["lse2"] = e(1, heads, rows_pad, d=torch.float32)
         cos, sin = rotary
         self.layout = _Layout(key, rows, tile, n_tiles, n_ext, perm, inv, untile.index_select(0, perm).to(torch.int32),
                               tile_row0, vbs, vbs_ext, cos.index_select(0, perm).contiguous(),
@@ -290,14 +297,14 @@ class H3FastRunner:
             else:
                 k.qkv_prologue(q, kk, v, hs, L.tile_row0, L.vbs, attn.norm_q.weight, attn.norm_k.weight, L.cos, L.sin,
                                b["qb"], b["kb"], b["vb"], b["qp"], b["kp"], b["vp"], self.heads, L.n_tiles, L.tile,
-                               attn.norm_q.eps)
+                               attn.norm_q.eps, b.get("qc"), b.get("kc"), b.get("vc"))
             prev_tf32 = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = self.tf32_scores
             torch.baddbmm(b["sc"], b["qp"], b["kp"].transpose(1, 2), beta=0.0, alpha=sm_scale, out=b["sc"])
             dense = index in meta.dense_layers
             k.topk_rows(b["sc"], L.n_tiles, L.n_ext, meta.num_prefix_tiles, starts, ends,
                         dense_ks if dense else sparse_ks, b["idx"], b["num"], split)
-            oc = None
+            oc, lse2 = None, b.get("lse2")
             if gate_entry is not None:
                 oc = torch.bmm(torch.softmax(b["sc"], dim=-1), b["vp"]).to(x.dtype)
             torch.backends.cuda.matmul.allow_tf32 = prev_tf32
@@ -315,11 +322,14 @@ class H3FastRunner:
                 coef = sm_scale * math.log2(math.e) * (1.0 if self.qk16 else s_q * s_k)
                 out = k.vsa_fp8(b["qb"], b["kb"], b["vb"], b["idx"], b["num"], L.vbs_ext, coef, b["vs_blk"],
                                 b["vs_head"])
+            elif split:
+                self._dense_prefix(index, L, 1.0, 1.0)
+                out, lse2 = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, True)
             else:
                 out = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, False)[0]
             k.attn_gate_quant(out, g if gate_entry is not None else None, hs if gate_entry is not None else None, oc, L.slot,
                               L.n_tiles, L.tile, a, a_sf, as_, L.rows, b.get("o1"), b.get("lse1a"), b.get("lse1b"),
-                              b.get("lse2"))
+                              lse2)
             self._gemm(a, a_sf, attn.to_out, y)
             k.resid_norm_quant(x, y, as_, gate_msa, L.adaln, block.norm2.weight, shift_mlp, scale_mlp, x, h, h_sf, hs,
                                block.norm2.eps)
