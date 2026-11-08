@@ -10,8 +10,8 @@ plus a ready-to-run server. The model itself is unchanged.
 On one GB300, a 5-second clip with sound takes **11.57 s** from request to finished video file, as accurate as
 FastVideo's own standard 8-bit setting. FastVideo alone takes 17.32 s on the same GPU with all of its speed
 options, or 34.59 s as installed. Presets that trade a little accuracy for speed go down to **7.44 s**.
-FastH3 Omni, which also takes reference images, video or audio, takes 19.83 s per 5-second clip, down to
-16.23 s.
+FastH3 Omni, which also takes reference images, video or audio, takes 18.89 s per 5-second clip, down to
+15.40 s.
 
 - [Results](#results): every preset at 5, 10 and 15 seconds, FastVideo on the same GPU, other published systems
 - [How the server is set up](#how-the-server-is-set-up)
@@ -39,9 +39,9 @@ per request.
 | `qad-nvfp4` | 4-bit (QAD model) | partly 8-bit | 8.37 s | 20.78 s | 39.98 s | 0.271 / 0.158 |
 | `max` | 4-bit (QAD model) | 8-bit | 7.44 s | 17.86 s | 33.75 s | 0.282 / 0.167 |
 | `preview` | 4-bit (QAD model) | 8-bit, lighter decoder | 6.68 s | 16.46 s | 31.47 s | 0.282 / 0.167 (same as `max`; softer decoder) |
-| Omni, 1 reference image | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 16-bit | 19.83 s | 36.28 s | 56.41 s | 0.219 / 0.111 |
-| `omni-fast` | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 8-bit | 16.59 s | 30.23 s | 47.35 s | 0.226 / 0.119 |
-| `omni-max` | 4-bit (Omni QAD model) | 8-bit | 16.23 s | 29.08 s | 45.23 s | 0.230 / 0.117 |
+| Omni, 1 reference image | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 16-bit | 18.89 s | 35.45 s | 55.49 s | 0.219 / 0.111 |
+| `omni-fast` | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 8-bit | 15.77 s | 29.45 s | 46.33 s | 0.226 / 0.119 |
+| `omni-max` | 4-bit (Omni QAD model) | 8-bit | 15.40 s | 28.29 s | 44.16 s | 0.230 / 0.117 |
 
 **Error** is how far a preset's predictions drift from the full-precision (16-bit) model, given exactly the same input
 at each of the 8 steps, averaged over four prompts. Lower is better; 0 would be identical. FastVideo's own standard
@@ -80,9 +80,9 @@ Error with a 1,000-token prompt: 0.243 / 0.082; with a 10,000-token prompt: 0.25
 | `max` | 15 s, 10,000-token prompt | 47.08 s |
 | `preview` | 832×480, 5 s | 2.39 s |
 | `preview` | 5 s, 10,000-token prompt | 12.65 s |
-| Omni | 832×480, 5 s | 10.74 s |
+| Omni | 832×480, 5 s | 10.00 s |
 | Omni | 5 s, same reference image again (processed once) | 18.31 s |
-| `omni-max` | 832×480, 5 s | 9.13 s |
+| `omni-max` | 832×480, 5 s | 8.36 s |
 
 Per-step timings of every run (prompt reading, video generation, decoding): `results/`.
 
@@ -212,7 +212,7 @@ AAC audio.
 | Writing the video file | frames are converted on the GPU and streamed to the encoder | keep `pin_cpu_memory: true` (FastVideo's default): without it, copying frames off the GPU stalled for 10-25 s per clip on this machine |
 | Memory | everything stays on the GPU (about 134 of 252 GB) | |
 | Startup | two warm-up videos before taking requests | `FV_WARMUP=0` skips them |
-| Omni | FastVideo's 4-bit Omni model, attention partly 8-bit; a reference image used again is not processed twice (`FASTVIDEO_H3_REF2VA_MEMO_ENTRIES=16`) | `OMNI_ARGS=` (empty) runs the 16-bit Omni model with 8-bit math |
+| Omni | FastVideo's 4-bit Omni model, attention partly 8-bit; the reference image's tiles are encoded together instead of one by one (`FASTVIDEO_H3_VAE_ENCODE_TILE_BATCH=28`), and a reference image used again is not processed twice (`FASTVIDEO_H3_REF2VA_MEMO_ENTRIES=16`) | `OMNI_ARGS=` (empty) runs the 16-bit Omni model with 8-bit math |
 
 **Presets** (`docker compose --env-file profiles/<name>.env up -d <service>`):
 
@@ -287,6 +287,7 @@ Measured on 5-second 1344×768 text-to-video clips unless noted; each change bui
 | **Omni: prompt and reference attention done separately.** That part runs on FlashAttention-4's fast general-purpose code, the video part on the sparse code, and the two results are combined exactly | Omni 20.4 → 18.6 s, slightly more accurate | FlashAttention-4; Fireworks |
 | **The same for long text prompts** (1.1) | 10,000-token prompt: 24.0 → 20.1 s for a 5 s clip, 83.1 → 73.3 s for 15 s | |
 | **...and for the 8-bit presets** (1.2) | 10,000-token prompt, 5 s clip: `fast` 20.6 → 19.3 s, `max` 14.9 → 13.5 s | |
+| **Omni: the reference image encoded in one batch** (1.3) instead of tile by tile | 1.3 → 0.6 s per new reference; Omni 5 s clip 19.8 → 18.9 s | FastVideo's tile-batch option |
 
 FastVideo's own speed options are on as well: its fast attention code for this GPU, decoding the whole frame in one
 batch, its 4-bit quality decoder, 8-bit model math and a compiled video decoder.

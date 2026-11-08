@@ -46,6 +46,9 @@ x-common: &common
     FASTVIDEO_MINIMAX_H3_EXACT_KERNELS: ${FASTVIDEO_MINIMAX_H3_EXACT_KERNELS:-all}
     FASTVIDEO_H3_VSA_HEADS_FIRST_TILE: ${FASTVIDEO_H3_VSA_HEADS_FIRST_TILE:-1}
     FASTVIDEO_H3_VAE_TILE_BATCH: ${FASTVIDEO_H3_VAE_TILE_BATCH:-28}             # whole 4x7 tile grid per decoder call
+    # Spatial tiles per VAE encoder call for reference images and keyframes (FastVideo's option; 1 = per tile): a new
+    # Omni reference 1.29 -> 0.63 s; latents equal to 2.7e-4 relative L2 (reduction order only).
+    FASTVIDEO_H3_VAE_ENCODE_TILE_BATCH: ${FASTVIDEO_H3_VAE_ENCODE_TILE_BATCH:-28}
     FASTVIDEO_INFERENCE_TORCH_COMPILE: ${FASTVIDEO_INFERENCE_TORCH_COMPILE:-0}
     FASTVIDEO_DISABLE_ATTENTION_COMPILE: ${FASTVIDEO_DISABLE_ATTENTION_COMPILE:-1}
     # Exact reuse of reference encodes (Qwen3-VL + VAE keyframe) when a reference repeats (Omni re-rolls).

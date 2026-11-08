@@ -1,0 +1,27 @@
+{
+  "label": "rc5-omni-768p-10s",
+  "service": "omni",
+  "size": "server default",
+  "frames": 243,
+  "prompt": "short",
+  "first_s": 35.88,
+  "done_s": 35.446,
+  "fetched_s": 35.458,
+  "pipeline_s": 35.129,
+  "runs_done": [
+    35.51,
+    35.39
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 80.3,
+    "conditioning_stage": 570.6,
+    "latent_preparation_stage": 653.9,
+    "denoising_stage": 31761.1,
+    "video_decoding_stage": 1991.7,
+    "audio_decoding_stage": 71.0
+  },
+  "samples": [
+    "video_gen_c2b10955819f4259aed0a9a0751ae246.mp4",
+    "video_gen_bc76a1270f8c4a8da8257505c7461b77.mp4"
+  ]
+}
