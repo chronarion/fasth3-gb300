@@ -155,7 +155,8 @@ fmha_fp8_vsa_kernel(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
                     int seqlen, int num_heads, int num_samples, int num_blocks, int packed_mtiles_per_seq, int max_kv,
                     unsigned long long magic0, unsigned long long magic2, const int* __restrict__ q2k_idx,
                     const int* __restrict__ q2k_num, const int* __restrict__ variable_block_sizes,
-                    float qk_coef, const float* __restrict__ v_scale_blk, const float* __restrict__ v_scale_head) {
+                    float qk_coef, const float* __restrict__ v_scale_blk, const float* __restrict__ v_scale_head,
+                    float* __restrict__ lse_out) {
 #if !defined(__CUDA_ARCH__) || ((__CUDA_ARCH__ == 1000 && defined(__CUDA_ARCH_FEAT_SM100_ALL)) || \
                                 (__CUDA_ARCH__ == 1030 && defined(__CUDA_ARCH_FEAT_SM103_ALL)))
   uint8_t* sQ0 = fmha8_smem;
@@ -549,6 +550,13 @@ fmha_fp8_vsa_kernel(const __grid_constant__ CUtensorMap tmap_q, const __grid_con
         const float beta_par = (d >= 0.f) ? beta_lo : 1.f;
         const float l_tot = beta_own * l_own + beta_par * l_par;
         const float scale_own = (l_tot > 0.f) ? beta_own * rcp_approx_ftz_f32(l_tot) * vs_head : 0.f;
+        if (lse_out != nullptr && (corr_tid >> 6) == 0) {
+          // log2-domain LSE of the row (both halves combined; l carries 2^P_SHIFT, the V-block factors divided out)
+          const float m_tot = (d >= 0.f) ? m_own : m_par;
+          const int q_row = (i == 0 ? it.mtile0 : it.mtile1) * BLOCK + (corr_tid & 63);
+          lse_out[(size_t)(it.sample * num_heads + it.head) * seqlen + q_row] =
+              l_tot > 0.f ? m_tot * sl2 + __log2f(l_tot) - P_SHIFT : -INFINITY;
+        }
         const float2 scale2 = f32x2_splat(scale_own);
         const uint32_t o_tmem_addr = tmem_base + (uint32_t)(2 * S_COLS + i * O_COLS) + ((uint32_t)(corr_warp_id * 32) << 16);
         mbarrier_wait_parity_suspend(smem_ptr_u32(&empty_bar_o_epi[i]), o_epi_empty_ph.get_phase());
@@ -783,6 +791,7 @@ struct Args {
   float qk_coef;               // softmax scale * log2(e) * (E4M3 Q scale * K scale)
   const float* v_scale_blk;    // [B*H, num_blocks]
   const float* v_scale_head;   // [B*H]
+  float* lse;                  // optional [B*H, S] log2-domain LSE per query row
   int batch, num_heads, seqlen, num_blocks, max_kv;
 };
 
@@ -858,7 +867,7 @@ inline cudaError_t launch(const Args& a, cudaStream_t stream) {
   cfg.numAttrs = 1;
   return cudaLaunchKernelEx(&cfg, kfn, tq, tk, tv, to, S, H, B, a.num_blocks, packed_mtiles_per_seq, a.max_kv, magic0,
                             magic2, a.q2k_idx, a.q2k_num, a.variable_block_sizes, a.qk_coef, a.v_scale_blk,
-                            a.v_scale_head);
+                            a.v_scale_head, a.lse);
 }
 
 }  // namespace vsa_fp8

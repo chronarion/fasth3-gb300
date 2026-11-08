@@ -9,7 +9,7 @@
 
 torch::Tensor vsa_fp8_op(torch::Tensor q8, torch::Tensor k8, torch::Tensor v8, torch::Tensor q2k_idx,
                          torch::Tensor q2k_num, torch::Tensor vbs, double qk_coef, torch::Tensor v_scale_blk,
-                         torch::Tensor v_scale_head) {
+                         torch::Tensor v_scale_head, std::optional<torch::Tensor> lse) {
   const at::cuda::OptionalCUDAGuard guard(device_of(q8));
   TORCH_CHECK(q8.dim() == 4 && q8.size(-1) == vsa_fp8::HEAD_DIM && q8.is_contiguous() && k8.is_contiguous());
   TORCH_CHECK(k8.sizes() == q8.sizes() && v8.sizes() == q8.sizes() && v8.scalar_type() == at::kByte);
@@ -29,6 +29,8 @@ torch::Tensor vsa_fp8_op(torch::Tensor q8, torch::Tensor k8, torch::Tensor v8, t
   a.qk_coef = (float)qk_coef;
   a.v_scale_blk = v_scale_blk.data_ptr<float>();
   a.v_scale_head = v_scale_head.data_ptr<float>();
+  if (lse) TORCH_CHECK(lse->scalar_type() == at::kFloat && lse->numel() >= B * H * S && lse->is_contiguous());
+  a.lse = lse ? lse->data_ptr<float>() : nullptr;
   a.batch = (int)B;
   a.num_heads = (int)H;
   a.seqlen = (int)S;

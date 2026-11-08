@@ -872,10 +872,19 @@ void qkv_prologue8_op(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
       ptr<float>(vp), (int)heads, vb.size(-2), (int)n_tiles, (int)vs_blk.size(-1), (float)eps,                         \
       qc.has_value() ? qc->data_ptr() : nullptr, kc.has_value() ? kc->data_ptr() : nullptr, opt<bf16>(vc))
   const int wb = !qc.has_value() ? 0 : (qc->scalar_type() == at::kBFloat16 ? 1 : 2);
-  TORCH_CHECK(wb == 0 || (tile == 128 && kc.has_value() && vc.has_value()), "qkv_prologue8: write-back needs tile 128");
+  TORCH_CHECK(wb == 0 || (kc.has_value() && vc.has_value()), "qkv_prologue8: write-back needs qc, kc and vc");
   if (tile == 64) {
-    if (qk16) H3_P8(64, true, 0);
-    else H3_P8(64, false, 0);
+    if (wb == 1) {
+      if (qk16) H3_P8(64, true, 1);
+      else H3_P8(64, false, 1);
+    } else if (wb == 2) {
+      if (qk16) H3_P8(64, true, 2);
+      else H3_P8(64, false, 2);
+    } else if (qk16) {
+      H3_P8(64, true, 0);
+    } else {
+      H3_P8(64, false, 0);
+    }
   } else if (wb == 1) {
     if (qk16) H3_P8(128, true, 1);
     else H3_P8(128, false, 1);
@@ -892,7 +901,7 @@ void qkv_prologue8_op(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
 
 torch::Tensor vsa_fp8_op(torch::Tensor q8, torch::Tensor k8, torch::Tensor v8, torch::Tensor q2k_idx,
                          torch::Tensor q2k_num, torch::Tensor vbs, double qk_coef, torch::Tensor v_scale_blk,
-                         torch::Tensor v_scale_head);
+                         torch::Tensor v_scale_head, std::optional<torch::Tensor> lse);
 
 void topk_rows_op(torch::Tensor scores, int64_t n, int64_t n_ext, int64_t prefix, std::vector<int64_t> starts,
                   std::vector<int64_t> ends, std::vector<int64_t> ks, torch::Tensor idx, torch::Tensor num,

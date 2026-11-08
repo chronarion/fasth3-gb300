@@ -91,9 +91,8 @@ class H3FastRunner:
         # Layouts with an exempt prefix (text, audio, references): the prefix queries (against every key) and the prefix
         # keys (for every other query) as two dense FA4 calls, BF16 or E4M3 (Q/K static scales, V one scale per head);
         # the sparse kernel keeps only the selected video tiles and returns its LSE, and an LSE merge in the gate kernel
-        # joins the two. Sparse kernels with an LSE: the stock BF16 ones (64- and 128-token tiles) and the 128-token
-        # pair kernel; the 64-token 8-bit kernel has none, so that route keeps the prefix in the sparse pass. On when
-        # the prefix has at least FASTVIDEO_H3_DENSE_PREFIX_MIN_ROWS rows (long prompts, references).
+        # joins the two (every sparse route returns an LSE: the stock BF16 kernels, vsa_fp8 and the pair kernel). On
+        # when the prefix has at least FASTVIDEO_H3_DENSE_PREFIX_MIN_ROWS rows (long prompts, references).
         self.dense_prefix = os.environ.get("FASTVIDEO_H3_DENSE_PREFIX", "0")
         if self.dense_prefix not in ("0", "bf16", "fp8"):
             raise ValueError(f"FASTVIDEO_H3_DENSE_PREFIX={self.dense_prefix!r}: expected 0, bf16 or fp8")
@@ -182,8 +181,7 @@ class H3FastRunner:
             buffers["unum"] = torch.zeros(1, heads, n_ext, device=device, dtype=torch.int32)
             buffers["vbs64"] = torch.stack([vbs_ext.clamp(max=64), (vbs_ext - 64).clamp(min=0)], -1).flatten().contiguous()
         n_pre = int(vbs[:meta.num_prefix_tiles].sum().item()) if meta.num_prefix_tiles > 0 else 0
-        lse_route = (tile == 128 and self.pair128) or not self.fp8_attn
-        if self.dense_prefix == "0" or not lse_route or n_pre == 0 or n_pre < self.dense_prefix_min_rows:
+        if self.dense_prefix == "0" or n_pre == 0 or n_pre < self.dense_prefix_min_rows:
             n_pre = 0
         if n_pre:
             qk = torch.bfloat16 if self.dense_prefix == "bf16" else _FP8
@@ -195,7 +193,7 @@ class H3FastRunner:
             buffers["o1"] = e(1, rows, heads, dim)
             buffers["lse1a"] = e(1, heads, n_pre, d=torch.float32)
             buffers["lse1b"] = e(1, heads, rows - n_pre, d=torch.float32)
-            if self.pair128 and tile == 128:
+            if self.fp8_attn:  # the 8-bit kernels write into it; the stock BF16 kernel returns its own
                 buffers["lse2"] = e(1, heads, rows_pad, d=torch.float32)
         cos, sin = rotary
         self.layout = _Layout(key, rows, tile, n_tiles, n_ext, perm, inv, untile.index_select(0, perm).to(torch.int32),
@@ -320,8 +318,10 @@ class H3FastRunner:
                                  b["vs_blk"] if eight else None, b["vs_head"] if eight else None, b.get("lse2"))
             elif self.fp8_attn:
                 coef = sm_scale * math.log2(math.e) * (1.0 if self.qk16 else s_q * s_k)
+                if split:
+                    self._dense_prefix(index, L, s_q, s_k)
                 out = k.vsa_fp8(b["qb"], b["kb"], b["vb"], b["idx"], b["num"], L.vbs_ext, coef, b["vs_blk"],
-                                b["vs_head"])
+                                b["vs_head"], b.get("lse2"))
             elif split:
                 self._dense_prefix(index, L, 1.0, 1.0)
                 out, lse2 = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, True)
