@@ -13,6 +13,12 @@ options, or 34.59 s as installed. Presets that trade a little accuracy for speed
 FastH3 Omni, which also takes reference images, video or audio, takes 18.89 s per 5-second clip, down to
 15.40 s.
 
+At 832×480 (480p) a 5-second clip takes **4.01 s** (**2.71 s** with `max`), and at 640×640, the size
+ComfyUI's FastH3 template uses by default, 3.79 s (2.49 s). For comparison, a published run of
+ComfyUI's official FastH3 template on an RTX 5090 home GPU took 18.7 s for the same 5-second 832×480 clip and
+50.8-52.8 s at 1344×768. The GPUs differ, so this compares setups, not chips; see
+[Differences from ComfyUI's FastH3 workflow](#differences-from-comfyuis-fasth3-workflow).
+
 - [Results](#results): every preset at 5, 10 and 15 seconds, FastVideo on the same GPU, other published systems
 - [How the server is set up](#how-the-server-is-set-up)
 - [Differences from ComfyUI's FastH3 workflow](#differences-from-comfyuis-fasth3-workflow)
@@ -260,16 +266,23 @@ home GPUs with 24-32 GB of memory. Its defaults next to this server's:
 
 </details>
 
-FastVideo does not make H3 clips shorter than 5 seconds, so the 640×640 rows above use 5-second clips.
-
 Two of these change what you get, not only the speed. ComfyUI uses a different sampler than the one the model was
 trained with. It also keeps half as many video chunks in attention as the model was trained with. On this repository's
 code (version 1.0), keeping 10% instead of 20% raised the error from 0.194 / 0.071 to 0.284 / 0.089.
 
-On a home PC: a published run of the ComfyUI template on an RTX 5090 (ComfyUI 0.37 with the 4-bit V2 model file,
-1344×768, 5 seconds, text to video) took 50.8-52.8 s from submit to saved file, and 18.7 s at 832×480. FastVideo
-itself on the same card: 38.6 s and 14.8 s. This server on a GB300: 11.57 s and 4.01 s with the default
-preset, 7.44 s and 2.71 s with `max`.
+Speed next to a home PC. The ComfyUI column is a published run on an RTX 5090 (ComfyUI 0.37 with the official
+template and the 4-bit V2 model file, text to video, timed from submit to saved file). The FastVideo column is
+FastVideo's own published figures for that card, timed from reading the prompt to the MP4. This server's numbers
+are from one GB300, request to finished MP4. Every row is a 5-second clip:
+
+| Size | ComfyUI template, RTX 5090 | FastVideo, RTX 5090 | This server, default | This server, `max` |
+|---|---:|---:|---:|---:|
+| 832×480 (480p) | 18.7 s | 14.8 s | 4.01 s | 2.71 s |
+| 640×640 (the template's default size) | - | - | 3.79 s | 2.49 s |
+| 1344×768 | 50.8-52.8 s | 38.6 s | 11.57 s | 7.44 s |
+
+The template itself makes 2-second clips at 640×640; FastVideo's server does not make H3 clips under 5 seconds, so
+the 640×640 row is a 5-second clip and has no published ComfyUI time to set beside it.
 
 ## What makes it fast
 
