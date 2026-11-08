@@ -1,0 +1,27 @@
+{
+  "label": "qad-768p-15s",
+  "service": "t2v",
+  "size": "server default",
+  "frames": 362,
+  "prompt": "short",
+  "first_s": 40.19,
+  "done_s": 39.98,
+  "fetched_s": 40.01,
+  "pipeline_s": 39.63,
+  "runs_done": [
+    39.99,
+    39.97
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 56.9,
+    "latent_preparation_stage": 68.3,
+    "denoising_stage": 36390.8,
+    "video_decoding_stage": 3016.3,
+    "audio_decoding_stage": 97.3
+  },
+  "samples": [
+    "video_gen_d72a49480b08406cbc4bce2569ec2c29.mp4",
+    "video_gen_62f244bd34594463af263e9a724645c2.mp4"
+  ]
+}

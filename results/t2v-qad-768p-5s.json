@@ -1,0 +1,35 @@
+{
+  "label": "qad-768p-5s",
+  "service": "t2v",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "first_s": 8.37,
+  "done_s": 8.372,
+  "fetched_s": 8.383,
+  "pipeline_s": 8.2,
+  "runs_done": [
+    8.31,
+    8.36,
+    8.39,
+    8.38,
+    8.36,
+    8.39
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.1,
+    "conditioning_stage": 60.2,
+    "latent_preparation_stage": 25.6,
+    "denoising_stage": 7036.7,
+    "video_decoding_stage": 1003.6,
+    "audio_decoding_stage": 71.1
+  },
+  "samples": [
+    "video_gen_c8ef4dca92304e4190e967967863eb2d.mp4",
+    "video_gen_288275d2a71c42c0bc16bbd82ffbbf38.mp4",
+    "video_gen_e24f0421c6074657a03342af8757429a.mp4",
+    "video_gen_819c2a971ecd47e8b08fba39338294a9.mp4",
+    "video_gen_008e63a89ffa4c9cbab01834f0630f06.mp4",
+    "video_gen_01dba49c6013412e9e269ae18611d418.mp4"
+  ]
+}

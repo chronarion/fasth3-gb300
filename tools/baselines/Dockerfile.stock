@@ -1,0 +1,8 @@
+# FastVideo's own image (a01c50a, sm_103a; see the main Dockerfile) with only its dependency conflict fixed: its
+# FlashAttention-4 pin brings nvidia-cutlass-dsl 4.6.0.dev0, and its FlashInfer 0.7.4rc1 then fails to import
+# ("cutlass.cute has no attribute FastDivmodDivisorV2"), so the H3 server does not start. Same versions as the main image.
+#   docker build -t fastvideo:gb300-a01c50a-depfix -f tools/baselines/Dockerfile.stock .
+ARG BASE=fastvideo:gb300-a01c50a
+FROM ${BASE}
+RUN /opt/venv/bin/python -m pip install --no-cache-dir --no-deps \
+      "nvidia-cutlass-dsl==4.8.1" "nvidia-cutlass-dsl-libs-base==4.8.1" "flash-attn-4==4.0.0b36"

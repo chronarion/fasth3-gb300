@@ -1,0 +1,6 @@
+serve/.env
+serve/media/
+serve/cache/
+serve/quality/
+__pycache__/
+*.pyc

@@ -1,0 +1,31 @@
+# Baseline: stock FastVideo at commit a01c50a on one GB300, out of the box: FastVideo's own image with only its
+# dependency conflict fixed (Dockerfile.stock), BF16, no torch.compile, none of FastVideo's optional speed switches; the
+# same model, server config and request defaults as serve/ (one GPU, nothing offloaded). Runs as root: the stock image
+# keeps its Python under /root.
+#   docker build -t fastvideo:gb300-a01c50a-depfix -f tools/baselines/Dockerfile.stock .
+#   docker compose -f tools/baselines/fastvideo-stock.yml --project-directory serve up -d t2v
+#   python3 tools/bench.py stock --container fasth3-stock-t2v
+name: fasth3-stock
+services:
+  t2v:
+    image: ${FASTVIDEO_BASE_IMAGE:-fastvideo:gb300-a01c50a-depfix}
+    container_name: fasth3-stock-t2v
+    user: "0:0"
+    ipc: host
+    init: true
+    shm_size: 32g
+    restart: "no"
+    ports: ["${FASTH3_PORT:-8101}:8101"]
+    devices:
+      - ${FASTH3_GPU:?set FASTH3_GPU to the GB300's CDI device, e.g. nvidia.com/gpu=GPU-<uuid>}
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRITON_CACHE_DIR: /cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /cache/inductor
+    volumes:
+      - ${FASTH3_HF:?set FASTH3_HF to the Hugging Face cache that holds the models}:/root/.cache/huggingface:ro
+      - ${FASTH3_MEDIA:-./media}:/media
+      - ${FASTH3_CACHE:-./cache}-stock:/cache
+      - .:/config:ro
+    entrypoint: ["sh", "-c", "/opt/venv/bin/fastvideo serve --config /config/fasth3-8step.yaml & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; /opt/venv/bin/python3 -I /config/warmup.py fasth3 & wait $$s"]

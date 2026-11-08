@@ -1,0 +1,35 @@
+{
+  "label": "omni-768p-5s-reroll",
+  "service": "omni",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "first_s": 18.52,
+  "done_s": 18.306,
+  "fetched_s": 18.313,
+  "pipeline_s": 18.091,
+  "runs_done": [
+    18.58,
+    18.58,
+    18.62,
+    18.01,
+    18.04,
+    18.02
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 81.4,
+    "conditioning_stage": 313.5,
+    "latent_preparation_stage": 62.5,
+    "denoising_stage": 16571.9,
+    "video_decoding_stage": 1007.5,
+    "audio_decoding_stage": 71.6
+  },
+  "samples": [
+    "video_gen_1f0e27724a094969994901cff56e5814.mp4",
+    "video_gen_9edbdb218fb84b848cf4e2d03438cd51.mp4",
+    "video_gen_94cd405f2d5f4185a6f7d2d4e3490e01.mp4",
+    "video_gen_5a19d950bd8c4563b74a3d45f625eba5.mp4",
+    "video_gen_3fe5124e82c6426692b746c91598b73b.mp4",
+    "video_gen_86683ba83d424a03b2f0e2f6725556dd.mp4"
+  ]
+}

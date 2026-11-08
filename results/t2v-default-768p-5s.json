@@ -1,0 +1,35 @@
+{
+  "label": "default-768p-5s",
+  "service": "t2v",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "first_s": 11.61,
+  "done_s": 11.646,
+  "fetched_s": 11.656,
+  "pipeline_s": 11.474,
+  "runs_done": [
+    11.61,
+    11.62,
+    11.64,
+    11.66,
+    11.66,
+    11.66
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 64.8,
+    "latent_preparation_stage": 25.5,
+    "denoising_stage": 10309.9,
+    "video_decoding_stage": 1001.2,
+    "audio_decoding_stage": 69.0
+  },
+  "samples": [
+    "video_gen_e4de221cc94446e88ac6d37463ad3ce5.mp4",
+    "video_gen_55e24d97ca6e425f8acddab34745fb3c.mp4",
+    "video_gen_1e2ac1b13e3a4b44827759f695f8521f.mp4",
+    "video_gen_fcaa5baf215b4e8b9a2ee3e448ecc714.mp4",
+    "video_gen_13929bdf13e54b34b12dc72d130f75c9.mp4",
+    "video_gen_06039618eb494f4f8d94a21c9aedcd7f.mp4"
+  ]
+}

@@ -1,0 +1,94 @@
+# FastH3 (FastVideo's 8-step distillation of MiniMax-H3: text -> 5 s of 1344x768 video with stereo audio) on one GB300,
+# behind FastVideo's OpenAI-style video API. Two services share one port; run one at a time:
+#   docker compose up -d t2v        text -> video + audio (FastVideo-FastH3-8-Step-V2)
+#   docker compose up -d omni       text + image/video/audio references -> video + audio (FastH3 Omni)
+# Profiles (profiles/*.env) switch the lossy speed options:  docker compose --env-file profiles/fast.env up -d t2v
+# Settings and measured effect of every switch: ../README.md.
+name: fasth3
+
+x-common: &common
+  image: ${FASTH3_IMAGE:-fasth3-gb300}
+  user: "${FASTH3_UID:-1000}:${FASTH3_GID:-1000}"
+  ipc: host
+  init: true
+  shm_size: 32g
+  restart: "no"
+  ports: ["${FASTH3_PORT:-8101}:8101"]
+  devices:
+    # The GB300 by CDI name (Docker's CDI support; `docker info` lists the discovered devices). On a DGX Station use
+    # the GB300's UUID: NVML index 0 is the RTX PRO 6000 there.
+    - ${FASTH3_GPU:?set FASTH3_GPU to the GB300's CDI device, e.g. nvidia.com/gpu=GPU-<uuid>}
+  environment: &common_env
+    # The venv's bin (ninja for FlashInfer's NVFP4 JIT) is not on the image PATH.
+    PATH: /opt/venv/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    HOME: /cache
+    USER: fasth3
+    HF_HOME: /root/.cache/huggingface
+    HF_HUB_OFFLINE: "1"
+    TRITON_CACHE_DIR: /cache/triton
+    TORCHINDUCTOR_CACHE_DIR: /cache/inductor
+    # Fused DiT path (fastvideo/models/dits/h3fast): each block runs as 5 fused CUDA kernels plus the GEMMs and the
+    # attention kernel, FP8 activations with one scale per row. Needs DiT compile off (FV_ARGS below).
+    FASTVIDEO_H3_FAST: ${FASTVIDEO_H3_FAST:-1}
+    # Attention precision: "" = BF16 (t2v default), pv = BF16 QK^T + E4M3 PV, 1 = E4M3 QK^T too (profiles/).
+    FASTVIDEO_H3_FP8_ATTN: ${FASTVIDEO_H3_FP8_ATTN:-}
+    # TF32 for the two small fp32 matmuls that score tiles for the top-k selection (0 = fp32).
+    FASTVIDEO_H3_TF32_SCORES: ${FASTVIDEO_H3_TF32_SCORES:-1}
+    # Decoded frames -> yuv420p on the GPU, raw yuv into ffmpeg (ffmpeg's RGB conversion is slow on Grace); keeps the
+    # pixel buffers pinned.
+    FASTVIDEO_H3_YUV_OUT: ${FASTVIDEO_H3_YUV_OUT:-1}
+    # FlashAttention-4 for the VAE decoder's attention.
+    FASTVIDEO_FA4: ${FASTVIDEO_FA4:-1}
+    # Qwen3-VL encoder attention: "" = FA2 (t2v: short prompts encode faster on FA2), cudnn (Omni default).
+    FASTVIDEO_H3_ENCODER_SDPA: ${FASTVIDEO_H3_ENCODER_SDPA-}
+    # FastVideo's own speed switches.
+    FASTVIDEO_VSA_PTX_BLACKWELL: ${FASTVIDEO_VSA_PTX_BLACKWELL:-1}            # tcgen05 VSA kernel
+    FASTVIDEO_MINIMAX_H3_EXACT_KERNELS: ${FASTVIDEO_MINIMAX_H3_EXACT_KERNELS:-all}
+    FASTVIDEO_H3_VSA_HEADS_FIRST_TILE: ${FASTVIDEO_H3_VSA_HEADS_FIRST_TILE:-1}
+    FASTVIDEO_H3_VAE_TILE_BATCH: ${FASTVIDEO_H3_VAE_TILE_BATCH:-28}             # whole 4x7 tile grid per decoder call
+    FASTVIDEO_INFERENCE_TORCH_COMPILE: ${FASTVIDEO_INFERENCE_TORCH_COMPILE:-0}
+    FASTVIDEO_DISABLE_ATTENTION_COMPILE: ${FASTVIDEO_DISABLE_ATTENTION_COMPILE:-1}
+    # Exact reuse of reference encodes (Qwen3-VL + VAE keyframe) when a reference repeats (Omni re-rolls).
+    FASTVIDEO_H3_REF2VA_MEMO_ENTRIES: ${FASTVIDEO_H3_REF2VA_MEMO_ENTRIES:-16}
+    # FastVideo's NVFP4 video decoder, quality tier (36 layers; 37.9 dB vs the FP32 decoder on FastH3 V2 clips, per its
+    # model card). Empty = the full decoder; profiles/preview.env selects the 8-layer fast tier.
+    FASTVIDEO_H3_VAE_NVFP4_DECODER: ${FASTVIDEO_H3_VAE_NVFP4_DECODER-/root/.cache/huggingface/hub/models--FastVideo--FastH3-NVFP4-VAE-Decoder/snapshots/bd0c248f2a0f57ca643b3df2ac1f375fa55101fb/quality-36L/decoder-nvfp4.safetensors}
+    # Omni transformer: FastVideo's quantization-aware NVFP4 Omni (FastH3-Omni-NVFP4-QAD transformer_ref, composed by
+    # tools/download_models.sh). OMNI_ARGS= (empty) runs the BF16 Omni-8-Step-V1 transformer with FP8 linears.
+    OMNI_ARGS: ${OMNI_ARGS---generator.model_path /root/.cache/huggingface/composed/fasth3-omni-qad --generator.engine.quantization.transformer_quant NVFP4 --generator.engine.quantization.layer_profile h3_dit_vsa}
+    # Startup warmup (warmup.py): two prompt lengths before real traffic; /health is up meanwhile, requests queue.
+    FV_WARMUP: ${FV_WARMUP:-1}
+    FV_WARMUP_REF: ${FV_WARMUP_REF:-/media/in/reference.png}
+    # FP8 DiT linears (per-tensor weights; the fused path quantizes activations per row), compiled VAE, no DiT compile
+    # (the fused path runs eager).
+    FV_ARGS: ${FV_ARGS:---generator.engine.compile.vae_enabled true --generator.engine.quantization.transformer_quant FP8}
+    # Measurement only (README, "Quality"): H3Q_DUMP=/q/<name> records every denoising step's inputs and velocities,
+    # H3Q_REPLAY=/q/<name> feeds a run the recorded inputs and logs the relative L2 of its velocities against them.
+    H3Q_DUMP: ${H3Q_DUMP:-}
+    H3Q_REPLAY: ${H3Q_REPLAY:-}
+  volumes:
+    - ${FASTH3_HF:?set FASTH3_HF to the Hugging Face cache that holds the models}:/root/.cache/huggingface:ro
+    - ${FASTH3_MEDIA:-./media}:/media
+    - ${FASTH3_CACHE:-./cache}:/cache
+    - ${FASTH3_QDIR:-./quality}:/q
+    - .:/config:ro
+
+services:
+  t2v:
+    <<: *common
+    container_name: fasth3-t2v
+    entrypoint: ["sh", "-c", "/opt/venv/bin/fastvideo serve --config /config/fasth3-8step.yaml $$FV_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3 ) & wait $$s"]
+
+  omni:
+    <<: *common
+    container_name: fasth3-omni
+    environment:
+      <<: *common_env
+      # Omni attention: E4M3 PV on the 128-token pair kernel for the selected video tiles.
+      FASTVIDEO_H3_FP8_ATTN: ${OMNI_FP8_ATTN-pv}
+      # Dense prefix: the reference/text prefix queries (against every key) and the prefix keys (for every other query)
+      # run as two dense FlashAttention-4 calls, merged with the sparse rest by log-sum-exp. bf16 or fp8 (omni-fast).
+      FASTVIDEO_H3_DENSE_PREFIX: ${OMNI_DENSE_PREFIX-bf16}
+      # cuDNN fused attention for the encoder, which sees the reference image's vision tokens.
+      FASTVIDEO_H3_ENCODER_SDPA: ${OMNI_ENCODER_SDPA-cudnn}
+    entrypoint: ["sh", "-c", "/opt/venv/bin/fastvideo serve --config /config/fasth3-omni.yaml $$FV_ARGS $$OMNI_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3-omni $$FV_WARMUP_REF ) & wait $$s"]

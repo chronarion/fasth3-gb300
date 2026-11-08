@@ -1,0 +1,12 @@
+fasth3-gb300
+Copyright 2026 the fasth3-gb300 authors
+
+This repository patches FastVideo (https://github.com/hao-ai-lab/FastVideo), licensed under the Apache License 2.0.
+
+fastvideo/models/dits/h3fast/vsa_primitives.cuh is a copy of FastVideo's
+fastvideo-kernel/csrc/attention/primitives.cuh (commit a01c50a) with one function added.
+fastvideo/models/dits/h3fast/vsa_fp8.cuh and vsa_pair.cuh are derived from FastVideo's
+fastvideo-kernel/csrc/attention/block_sparse_kernel_blackwell.cuh. patches/fastvideo-a01c50a.patch modifies FastVideo
+source files. The header of each derived file describes its changes.
+
+Model weights are not included; each FastVideo / MiniMax checkpoint carries its own license.

@@ -1,0 +1,35 @@
+{
+  "label": "omni-480p-5s",
+  "service": "omni",
+  "size": "832x480",
+  "frames": 124,
+  "prompt": "short",
+  "first_s": 12.73,
+  "done_s": 10.741,
+  "fetched_s": 10.745,
+  "pipeline_s": 10.571,
+  "runs_done": [
+    10.79,
+    10.72,
+    10.74,
+    10.72,
+    10.75,
+    10.75
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 81.1,
+    "conditioning_stage": 572.3,
+    "latent_preparation_stage": 1328.6,
+    "denoising_stage": 8077.1,
+    "video_decoding_stage": 440.9,
+    "audio_decoding_stage": 71.8
+  },
+  "samples": [
+    "video_gen_4f5eb95240ce42d69800bb36ed1dcbd3.mp4",
+    "video_gen_4829cc5186de4d508b950779bf140307.mp4",
+    "video_gen_e8eb63f6bc81410481b6b9ef1cc8c086.mp4",
+    "video_gen_406dfee7b45f412b830447610a3d29f7.mp4",
+    "video_gen_2b3a66c723e94e5ea536be5d45198e1d.mp4",
+    "video_gen_e8a32e184dd04d38b182032132fbdf0d.mp4"
+  ]
+}

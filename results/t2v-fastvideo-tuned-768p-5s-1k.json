@@ -1,0 +1,29 @@
+{
+  "label": "fastvideo-tuned-768p-5s-1k",
+  "service": "t2v",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "long-1k.txt",
+  "first_s": 20.5,
+  "done_s": 18.54,
+  "fetched_s": 18.554,
+  "pipeline_s": 17.174,
+  "runs_done": [
+    18.53,
+    18.54,
+    18.87
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 64.1,
+    "latent_preparation_stage": 25.4,
+    "denoising_stage": 16016.3,
+    "video_decoding_stage": 994.0,
+    "audio_decoding_stage": 69.9
+  },
+  "samples": [
+    "video_gen_8bd48205bf594df69e18e535a04e715b.mp4",
+    "video_gen_0da0ce99fe074546ba7979baa506a599.mp4",
+    "video_gen_e0a498c8f07645a18ce9a0694bf96920.mp4"
+  ]
+}

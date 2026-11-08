@@ -1,0 +1,13 @@
+# Baseline: FastVideo a01c50a with all of its own speed options for this model on one GB300, and none of this
+# repository's: FP8 linears, compiled VAE, the tcgen05 VSA kernel, the exact fused kernels (FUSIONS=mk), the tile-first
+# VSA layout, FlashAttention-4 in the VAE, the NVFP4 quality decoder and batched VAE tiles. The fused path, the GPU yuv
+# output and the TF32 selection are off (this repository's image, so the NVFP4 decoder's FlashInfer works).
+#   docker compose -f serve/docker-compose.yml -f tools/baselines/fastvideo-tuned.yml --project-directory serve up -d t2v
+services:
+  t2v:
+    environment:
+      FASTVIDEO_H3_FAST: "0"
+      FASTVIDEO_H3_YUV_OUT: "0"
+      FASTVIDEO_H3_TF32_SCORES: "0"
+      FASTVIDEO_MINIMAX_H3_FUSIONS: mk
+      FASTVIDEO_H3_VSA_TILE_FIRST: "1"

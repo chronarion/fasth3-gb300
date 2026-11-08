@@ -1,0 +1,35 @@
+{
+  "label": "fastvideo-tuned-768p-5s",
+  "service": "t2v",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "first_s": 17.28,
+  "done_s": 17.316,
+  "fetched_s": 17.327,
+  "pipeline_s": 15.948,
+  "runs_done": [
+    17.3,
+    17.3,
+    17.31,
+    17.38,
+    17.33,
+    17.38
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 62.7,
+    "latent_preparation_stage": 25.5,
+    "denoising_stage": 14801.6,
+    "video_decoding_stage": 990.0,
+    "audio_decoding_stage": 71.1
+  },
+  "samples": [
+    "video_gen_d8916df84a0b4620b249cd52eeb9c343.mp4",
+    "video_gen_3e541d7c519843498b2ae337f70c2552.mp4",
+    "video_gen_9dd7180177dc4e05afdab226b9786f32.mp4",
+    "video_gen_8921bfdd3a1549cdbb1e299369e32313.mp4",
+    "video_gen_bef2f7c2e29a4225adecfc31b3e525b3.mp4",
+    "video_gen_650d46e9216240208bbdb6825924d591.mp4"
+  ]
+}
