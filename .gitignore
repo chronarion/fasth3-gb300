@@ -4,3 +4,4 @@ serve/cache/
 serve/quality/
 __pycache__/
 *.pyc
+serve/loras/*.safetensors

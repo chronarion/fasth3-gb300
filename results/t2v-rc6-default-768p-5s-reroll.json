@@ -1,0 +1,36 @@
+{
+  "label": "rc6-default-768p-5s-reroll",
+  "service": "t2v",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short, re-roll",
+  "lora": null,
+  "first_s": 11.55,
+  "done_s": 11.463,
+  "fetched_s": 11.472,
+  "pipeline_s": 11.289,
+  "runs_done": [
+    11.44,
+    11.45,
+    11.45,
+    11.47,
+    11.47,
+    11.47
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 0.3,
+    "latent_preparation_stage": 25.6,
+    "denoising_stage": 10194.5,
+    "video_decoding_stage": 998.3,
+    "audio_decoding_stage": 72.4
+  },
+  "samples": [
+    "video_gen_f7314a479dbf4eaeaaf2d0fdc58cc3b5.mp4",
+    "video_gen_20aee5e6063e474e947f5b79aeec92dd.mp4",
+    "video_gen_70b9bafc95b140268c79f3f65b3cf6b5.mp4",
+    "video_gen_3074a3c8610942069315b67cb7877263.mp4",
+    "video_gen_b21f12c3b34d4b399448825e973f2f64.mp4",
+    "video_gen_17a4cd6b419646f9836f90abef1fc3a1.mp4"
+  ]
+}

@@ -50,6 +50,24 @@ def _vsa_forward(tile: int) -> Any:
     return ops.block_sparse_ptx_blackwell_fwd if tile == 64 else ops.block_sparse_ptx_blackwell_blk128_fwd
 
 
+def _base(layer: Any) -> Any:
+    """The linear under a FastVideo LoRA wrapper (``BaseLayerWithLoRA.base_layer``), or the layer itself."""
+    return getattr(layer, "base_layer", layer)
+
+
+def _adapter(layer: Any) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+    """(A, B, scale) of the side-branch LoRA adapter that ``layer`` adds to its base output (``y = base(x) + scale *
+    B(A x)``, scale = strength * alpha / rank), or None: no wrapper, no adapter for this layer, or strength 0. A
+    merged adapter is in the base weight already."""
+    if getattr(layer, "lora_A", None) is None or not getattr(layer, "side_branch", False):
+        return None
+    if layer._strength_is_zero or layer.disable_lora or layer.merged:
+        return None
+    rank, alpha = layer.lora_rank, layer.lora_alpha
+    scale = layer.lora_strength * (float(alpha) / float(rank) if alpha != rank else 1.0)
+    return layer.slice_lora_a_weights(layer.lora_A), layer.slice_lora_b_weights(layer.lora_B), scale
+
+
 @dataclass
 class _Layout:
     key: tuple
@@ -79,8 +97,9 @@ class H3FastRunner:
         self.heads = block.attn.num_attention_heads
         self.head_dim = block.attn.attention_head_dim
         self.hidden = block.norm1.weight.numel()
-        self.ffn = block.ff.fc_out.input_size if hasattr(block.ff.fc_out, "input_size") else 14336
-        self.fp4 = getattr(block.attn.to_q, "_nvfp4_weight", None) is not None
+        fc_out = _base(block.ff.fc_out)
+        self.ffn = fc_out.input_size if hasattr(fc_out, "input_size") else 14336
+        self.fp4 = getattr(_base(block.attn.to_q), "_nvfp4_weight", None) is not None
         # "pv": BF16 QK^T + E4M3 PV; "1": E4M3 QK^T too (faster, larger error).
         mode = os.environ.get("FASTVIDEO_H3_FP8_ATTN", "0")
         self.fp8_attn = mode in ("1", "pv")
@@ -104,17 +123,20 @@ class H3FastRunner:
         # per block. Selection can move at near-ties (the stock path scores in fp32); the teacher-forced error vs BF16
         # did not go up (0.194 / 0.071 -> 0.191 / 0.068). "0" keeps fp32.
         self.tf32_scores = os.environ.get("FASTVIDEO_H3_TF32_SCORES", "1") != "0"
-        self.layout: _Layout | None = None
+        self.layouts: dict[tuple, _Layout] = {}
         self.one: torch.Tensor | None = None
         self._gate_fp8: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._lora_dev: dict[int, tuple[Any, torch.Tensor, torch.Tensor]] = {}
+        # (input, A) -> x A^T of the last side branch; reset wherever the input buffers get new contents
+        self._lora_t: tuple[tuple, torch.Tensor] | None = None
         ext()
 
     @staticmethod
     def supported(model: Any, meta: Any) -> bool:
         block = model.transformer_blocks[0]
         attn = block.attn
-        fp8 = getattr(attn.to_q, "_fp8_weight", None) is not None
-        fp4 = all(getattr(lin, "_nvfp4_weight", None) is not None
+        fp8 = getattr(_base(attn.to_q), "_fp8_weight", None) is not None
+        fp4 = all(getattr(_base(lin), "_nvfp4_weight", None) is not None
                   for lin in (attn.to_q, attn.to_k, attn.to_v, attn.to_out, block.ff.fc_in, block.ff.fc_out))
         return (fp8 or fp4) and meta is not None and meta.exempt and not meta.pad_tokens and meta.tile_elems in (64, 128)
 
@@ -125,19 +147,25 @@ class H3FastRunner:
             return attn.to_gate_compress
         entry = self._gate_fp8.get(index)
         if entry is None:
-            weight = attn.to_gate_compress.weight.data
+            weight = _base(attn.to_gate_compress).weight.data
             scale = (weight.abs().amax().float() / _FP8_MAX).clamp(min=1e-12)
             entry = ((weight.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8), scale)
             self._gate_fp8[index] = entry
         return entry
 
-    def _get_layout(self, x: torch.Tensor, meta: Any, rotary: tuple[torch.Tensor, torch.Tensor],
-                    adaln: torch.Tensor) -> _Layout:
-        key = (meta.untile_combined_index.data_ptr(), x.shape[1], meta.tile_elems, rotary[0].data_ptr())
-        if self.layout is not None and self.layout.key == key:
-            self.layout.adaln = adaln.index_select(0, self.layout.perm).to(torch.int32)
-            return self.layout
-        device, rows, tile = x.device, x.shape[1], int(meta.tile_elems)
+    def _get_layout(self, rows: int, device: torch.device, meta: Any, rotary: tuple[torch.Tensor, torch.Tensor],
+                    adaln: torch.Tensor, fresh: bool = True) -> _Layout:
+        """The layout (row maps, tables, buffers) for this metadata, cached across steps. A new full layout (``fresh``)
+        drops every other one first; the token-reduction layout (``fresh=False``) lives beside the full one."""
+        key = (meta.untile_combined_index.data_ptr(), rows, meta.tile_elems, rotary[0].data_ptr())
+        layout = self.layouts.get(key)
+        if layout is not None:
+            layout.adaln = adaln.index_select(0, layout.perm).to(torch.int32)
+            return layout
+        if fresh:
+            self.layouts.clear()
+            self.__dict__.pop("_pair_cache", None)
+        tile = int(meta.tile_elems)
         untile = meta.untile_combined_index
         perm = torch.argsort(untile)
         inv = torch.empty_like(perm)
@@ -196,12 +224,46 @@ class H3FastRunner:
             if self.fp8_attn:  # the 8-bit kernels write into it; the stock BF16 kernel returns its own
                 buffers["lse2"] = e(1, heads, rows_pad, d=torch.float32)
         cos, sin = rotary
-        self.layout = _Layout(key, rows, tile, n_tiles, n_ext, perm, inv, untile.index_select(0, perm).to(torch.int32),
-                              tile_row0, vbs, vbs_ext, cos.index_select(0, perm).contiguous(),
-                              sin.index_select(0, perm).contiguous(), adaln.index_select(0, perm).to(torch.int32), buffers,
-                              n_pre)
+        layout = _Layout(key, rows, tile, n_tiles, n_ext, perm, inv, untile.index_select(0, perm).to(torch.int32),
+                         tile_row0, vbs, vbs_ext, cos.index_select(0, perm).contiguous(),
+                         sin.index_select(0, perm).contiguous(), adaln.index_select(0, perm).to(torch.int32), buffers,
+                         n_pre)
+        self.layouts[key] = layout
         self.one = torch.ones((), device=device, dtype=torch.float32)
-        return self.layout
+        return layout
+
+    def _pair_maps(self, plan: Any, L: _Layout, R: _Layout) -> dict[str, Any]:
+        """Token reduction index maps between the compact rows of the full layout L and of the paired layout R."""
+        key = (L.key, R.key, plan.first.data_ptr(), plan.parents.data_ptr())
+        maps = self.__dict__.setdefault("_pair_cache", {}).get(key)
+        if maps is None:
+            self._pair_cache.clear()
+            # reduced compact row -> the two full compact rows it averages (equal for unpaired rows)
+            ia = L.inv.index_select(0, plan.first.index_select(0, R.perm))
+            ib = L.inv.index_select(0, plan.second.index_select(0, R.perm))
+            # full compact row -> its reduced compact row, and whether it belongs to a true pair
+            par = R.inv.index_select(0, plan.parents.index_select(0, L.perm))
+            in_pair = torch.zeros(L.rows, device=ia.device, dtype=torch.bool)
+            in_pair[plan.pair_rows] = True
+            maps = self._pair_cache[key] = {
+                "ia": ia, "ib": ib, "par": par, "pair": in_pair.index_select(0, L.perm)[:, None],
+                "pooled": torch.empty(R.rows, self.hidden, device=ia.device, dtype=torch.bfloat16)}
+        return maps
+
+    def _pool(self, L: _Layout, R: _Layout, maps: dict[str, Any]) -> None:
+        """Paired rows into R's residual stream: the fp32 mean of both sources (unpaired rows copy exactly)."""
+        xa = L.buffers["x"].index_select(0, maps["ia"]).float()
+        xa.add_(L.buffers["x"].index_select(0, maps["ib"]).float()).mul_(0.5)
+        R.buffers["x"].copy_(xa)
+        maps["pooled"].copy_(R.buffers["x"])
+
+    def _expand(self, L: _Layout, R: _Layout, maps: dict[str, Any], scale: float) -> None:
+        """Full rows back from R: a paired row is its value before pooling plus scale x its pair's update; every
+        other row (prefix, an odd-width video's last column) takes the reduced output directly."""
+        xr = R.buffers["x"]
+        update = (xr.float() - maps["pooled"].float()).index_select(0, maps["par"])
+        paired = update.mul_(scale).add_(L.buffers["x"].float())
+        L.buffers["x"].copy_(torch.where(maps["pair"], paired, xr.index_select(0, maps["par"]).float()))
 
     def _qk_scales(self, index: int, attn: Any) -> tuple[float, float]:
         cached = self.__dict__.setdefault("_qk_scale_cache", {}).get(index)
@@ -235,10 +297,39 @@ class H3FastRunner:
                         out=o1[:, n_pre:], lse=b["lse1b"], **extra)
 
 
+    def _lora_add(self, layer: Any, a: torch.Tensor, out: torch.Tensor, sf: torch.Tensor | None = None) -> None:
+        """Add ``layer``'s side-branch LoRA adapter to its GEMM output. ``a`` is the GEMM's input (FP8, or NVFP4 with
+        its block scales ``sf``) in the same row-scaled units as ``out`` (each row's scale is applied downstream), so
+        the adapter sees what the base weight sees: out += scale * (a A^T) B^T."""
+        adapter = _adapter(layer)
+        if adapter is None:
+            return
+        A, B, scale = adapter
+        cached = self._lora_dev.get(id(layer))
+        if cached is None or cached[0] is not A:
+            # The pipeline may hold the factors on the host; copy them once per adapter, not per forward.
+            cached = (A, A.to(out.device, torch.bfloat16).t().contiguous(), B.to(out.device, torch.bfloat16).t().contiguous())
+            self._lora_dev[id(layer)] = cached
+        # q, k and v read the same input and (community LoRAs split one fused qkv adapter) share A: x A^T once.
+        key = (a.data_ptr(), A.data_ptr(), tuple(A.shape))
+        if self._lora_t is not None and self._lora_t[0] == key:
+            t = self._lora_t[1]
+        else:
+            if sf is None:
+                x = a.to(torch.bfloat16)
+            else:
+                x = torch.empty(a.shape[0], a.shape[1] * 2, device=a.device, dtype=torch.bfloat16)
+                ext().fp4_dequant(a, sf, x)
+            t = x @ cached[1]
+            self._lora_t = (key, t)
+        out.addmm_(t, cached[2], alpha=scale)
+
     def _gemm(self, a: torch.Tensor, sf: torch.Tensor | None, layer: Any, out: torch.Tensor) -> None:
+        wrapper, layer = layer, _base(layer)
         if sf is None:
             torch._scaled_mm(a, layer._fp8_weight.t(), scale_a=self.one, scale_b=layer._fp8_weight_scale,
                              out_dtype=torch.bfloat16, out=out)
+            self._lora_add(wrapper, a, out)
             return
         alpha = getattr(layer, "_h3fast_alpha", None)
         if alpha is None:
@@ -251,96 +342,133 @@ class H3FastRunner:
         # FlashInfer directly: the registered custom op refuses an out= buffer (aliasing check).
         _require_flashinfer()[1](a, weight.T, sf, layer._nvfp4_weight_scale.T, alpha, torch.bfloat16, out,
                                  block_size=16, use_8x4_sf_layout=False, backend=_mm_fp4_backend("h3_dit"))
+        self._lora_add(wrapper, a, out, sf)
 
     def forward(self, packed: torch.Tensor, temb: torch.Tensor, adaln_indices: torch.Tensor,
-                rotary: tuple[torch.Tensor, torch.Tensor], meta: Any) -> torch.Tensor:
-        L = self._get_layout(packed, meta, rotary, adaln_indices)
+                rotary: tuple[torch.Tensor, torch.Tensor], meta: Any, reduction: tuple | None = None) -> torch.Tensor:
+        """All blocks. ``reduction`` = (token-reduction plan, its rotary, its AdaLN indices): blocks [begin, end) run on
+        horizontally paired video rows in a second layout (see fastvideo/models/dits/minimax_h3_token_reduction.py)."""
+        L = self._get_layout(packed.shape[1], packed.device, meta, rotary, adaln_indices)
+        cfg = {id(L): self._attn_cfg(meta)}
+        R = maps = plan = None
+        begin = end = len(self.blocks)
+        if reduction is not None:
+            plan, r_rotary, r_adaln = reduction
+            R = self._get_layout(plan.reduced_length, packed.device, plan.attn_metadata, r_rotary, r_adaln, False)
+            cfg[id(R)] = self._attn_cfg(plan.attn_metadata)
+            maps = self._pair_maps(plan, L, R)
+            begin, end = plan.begin, plan.end
+        torch.index_select(packed[0], 0, L.perm, out=L.buffers["x"])
+        cur, tabs, norm_in = L, self.blocks[0].adaln_proj(temb), True
+        for index, block in enumerate(self.blocks):
+            if R is not None and index == begin:
+                self._pool(L, R, maps)
+                cur, norm_in = R, True
+            if R is not None and index == end:
+                self._expand(L, R, maps, plan.update_scale)
+                cur, norm_in = L, True
+            if norm_in:
+                b = cur.buffers
+                ext().resid_norm_quant(b["x"], None, None, None, cur.adaln, block.norm1.weight, tabs[0].to(b["x"].dtype),
+                                       tabs[1].to(b["x"].dtype), b["x"], b["h"], b.get("h_sf"), b["hs"], block.norm1.eps)
+            switch = R is not None and index + 1 in (begin, end)
+            tabs, norm_in = self._block(index, block, cur, cfg[id(cur)], tabs, temb, switch)
+        if R is not None and cur is R:
+            self._expand(L, R, maps, plan.update_scale)
+        return L.buffers["x"].index_select(0, L.inv).unsqueeze(0)
+
+    @staticmethod
+    def _attn_cfg(meta: Any) -> dict[str, Any]:
+        spans = meta.video_tile_spans
+        return {"starts": [s for s, _ in spans], "ends": [e for _, e in spans],
+                "sparse_ks": [compute_topk(sp, e - s) for (s, e), sp in zip(spans, meta.span_sparsities, strict=True)],
+                "dense_ks": [e - s for s, e in spans], "prefix_tiles": meta.num_prefix_tiles,
+                "dense_layers": meta.dense_layers}
+
+    def _block(self, index: int, block: Any, L: _Layout, cfg: dict[str, Any], tabs: Any, temb: torch.Tensor,
+               switch: bool) -> tuple[Any, bool]:
+        """One block on layout L; returns the next block's AdaLN tables and whether the next block still needs its
+        input norm (the last block, or the next one runs on the other token-reduction layout)."""
         k = ext()
         b = L.buffers
         x, y, q, kk, v, g, u = b["x"], b["y"], b["q"], b["k"], b["v"], b["g"], b["u"]
         h, hs, a, as_, f, fs = b["h"], b["hs"], b["a"], b["as"], b["f"], b["fs"]
         h_sf, a_sf, f_sf = b.get("h_sf"), b.get("a_sf"), b.get("f_sf")
-        torch.index_select(packed[0], 0, L.perm, out=x)
-        spans = meta.video_tile_spans
-        starts, ends = [s for s, _ in spans], [e for _, e in spans]
-        sparse_ks = [compute_topk(sp, e - s) for (s, e), sp in zip(spans, meta.span_sparsities, strict=True)]
-        dense_ks = [e - s for s, e in spans]
         fwd = _vsa_forward(L.tile)
         sm_scale = 1.0 / math.sqrt(self.head_dim)
-        tabs = self.blocks[0].adaln_proj(temb)
-        block = self.blocks[0]
-        k.resid_norm_quant(x, None, None, None, L.adaln, block.norm1.weight, tabs[0].to(x.dtype), tabs[1].to(x.dtype), x,
-                           h, h_sf, hs, block.norm1.eps)
-        for index, block in enumerate(self.blocks):
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (t.to(x.dtype) for t in tabs)
-            attn = block.attn
-            self._gemm(h, h_sf, attn.to_q, q)
-            self._gemm(h, h_sf, attn.to_k, kk)
-            self._gemm(h, h_sf, attn.to_v, v)
-            gate_entry = self._layer_gate(index, attn)
-            if gate_entry is not None:
-                if self.fp4:
-                    self._gemm(h, h_sf, gate_entry, g)
-                else:
-                    torch._scaled_mm(h, gate_entry[0].t(), scale_a=self.one, scale_b=gate_entry[1],
-                                     out_dtype=torch.bfloat16, out=g)
-            split = L.n_pre > 0
-            if self.fp8_attn:
-                s_q, s_k = self._qk_scales(index, attn)
-                b["vs_head"].zero_()
-                k.qkv_prologue8(q, kk, v, hs, L.tile_row0, L.vbs, attn.norm_q.weight, attn.norm_k.weight, L.cos, L.sin,
-                                1.0 / s_q, 1.0 / s_k, b["qb"], b["kb"], b["vb"], b["vs_blk"], b["vs_head"], b["qp"],
-                                b["kp"], b["vp"], self.heads, L.n_tiles, L.tile, attn.norm_q.eps, b.get("qc"),
-                                b.get("kc"), b.get("vc"))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (t.to(x.dtype) for t in tabs)
+        attn = block.attn
+        self._lora_t = None
+        self._gemm(h, h_sf, attn.to_q, q)
+        self._gemm(h, h_sf, attn.to_k, kk)
+        self._gemm(h, h_sf, attn.to_v, v)
+        gate_entry = self._layer_gate(index, attn)
+        if gate_entry is not None:
+            if self.fp4:
+                self._gemm(h, h_sf, gate_entry, g)
             else:
-                k.qkv_prologue(q, kk, v, hs, L.tile_row0, L.vbs, attn.norm_q.weight, attn.norm_k.weight, L.cos, L.sin,
-                               b["qb"], b["kb"], b["vb"], b["qp"], b["kp"], b["vp"], self.heads, L.n_tiles, L.tile,
-                               attn.norm_q.eps, b.get("qc"), b.get("kc"), b.get("vc"))
-            prev_tf32 = torch.backends.cuda.matmul.allow_tf32
-            torch.backends.cuda.matmul.allow_tf32 = self.tf32_scores
-            torch.baddbmm(b["sc"], b["qp"], b["kp"].transpose(1, 2), beta=0.0, alpha=sm_scale, out=b["sc"])
-            dense = index in meta.dense_layers
-            k.topk_rows(b["sc"], L.n_tiles, L.n_ext, meta.num_prefix_tiles, starts, ends,
-                        dense_ks if dense else sparse_ks, b["idx"], b["num"], split)
-            oc, lse2 = None, b.get("lse2")
-            if gate_entry is not None:
-                oc = torch.bmm(torch.softmax(b["sc"], dim=-1), b["vp"]).to(x.dtype)
-            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
-            if L.tile == 128 and self.pair128:
-                # each 128-key block as two 64-key blocks selected by both halves of the 128-row tile
-                torch.stack([2 * b["idx"], 2 * b["idx"] + 1], -1, out=b["uidx"].view(*b["idx"].shape, 2))
-                torch.mul(b["num"], 2, out=b["unum"])
-                eight = self.fp8_attn
-                scale = sm_scale * (s_q * s_k if eight and not self.qk16 else 1.0)
-                if split:
-                    self._dense_prefix(index, L, s_q, s_k)
-                out = k.vsa_pair(b["qb"], b["kb"], b["vb"], b["uidx"], b["umem"], b["unum"], b["vbs64"], scale,
-                                 b["vs_blk"] if eight else None, b["vs_head"] if eight else None, b.get("lse2"))
-            elif self.fp8_attn:
-                coef = sm_scale * math.log2(math.e) * (1.0 if self.qk16 else s_q * s_k)
-                if split:
-                    self._dense_prefix(index, L, s_q, s_k)
-                out = k.vsa_fp8(b["qb"], b["kb"], b["vb"], b["idx"], b["num"], L.vbs_ext, coef, b["vs_blk"],
-                                b["vs_head"], b.get("lse2"))
-            elif split:
-                self._dense_prefix(index, L, 1.0, 1.0)
-                out, lse2 = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, True)
-            else:
-                out = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, False)[0]
-            k.attn_gate_quant(out, g if gate_entry is not None else None, hs if gate_entry is not None else None, oc, L.slot,
-                              L.n_tiles, L.tile, a, a_sf, as_, L.rows, b.get("o1"), b.get("lse1a"), b.get("lse1b"),
-                              lse2)
-            self._gemm(a, a_sf, attn.to_out, y)
-            k.resid_norm_quant(x, y, as_, gate_msa, L.adaln, block.norm2.weight, shift_mlp, scale_mlp, x, h, h_sf, hs,
-                               block.norm2.eps)
-            self._gemm(h, h_sf, block.ff.fc_in, u)
-            k.swiglu_quant(u, hs, f, f_sf, fs)
-            self._gemm(f, f_sf, block.ff.fc_out, y)
-            if index + 1 < len(self.blocks):
-                nxt = self.blocks[index + 1]
-                tabs = nxt.adaln_proj(temb)
-                k.resid_norm_quant(x, y, fs, gate_mlp, L.adaln, nxt.norm1.weight, tabs[0].to(x.dtype), tabs[1].to(x.dtype), x,
-                                   h, h_sf, hs, nxt.norm1.eps)
-            else:
-                k.resid_norm_quant(x, y, fs, gate_mlp, L.adaln, None, None, None, x, None, None, None, 0.0)
-        return x.index_select(0, L.inv).unsqueeze(0)
+                torch._scaled_mm(h, gate_entry[0].t(), scale_a=self.one, scale_b=gate_entry[1],
+                                 out_dtype=torch.bfloat16, out=g)
+                self._lora_add(attn.to_gate_compress, h, g)
+        self._lora_t = None  # the next side branches read other buffers (and h gets new contents before fc_in)
+        split = L.n_pre > 0
+        if self.fp8_attn:
+            s_q, s_k = self._qk_scales(index, attn)
+            b["vs_head"].zero_()
+            k.qkv_prologue8(q, kk, v, hs, L.tile_row0, L.vbs, attn.norm_q.weight, attn.norm_k.weight, L.cos, L.sin,
+                            1.0 / s_q, 1.0 / s_k, b["qb"], b["kb"], b["vb"], b["vs_blk"], b["vs_head"], b["qp"],
+                            b["kp"], b["vp"], self.heads, L.n_tiles, L.tile, attn.norm_q.eps, b.get("qc"),
+                            b.get("kc"), b.get("vc"))
+        else:
+            k.qkv_prologue(q, kk, v, hs, L.tile_row0, L.vbs, attn.norm_q.weight, attn.norm_k.weight, L.cos, L.sin,
+                           b["qb"], b["kb"], b["vb"], b["qp"], b["kp"], b["vp"], self.heads, L.n_tiles, L.tile,
+                           attn.norm_q.eps, b.get("qc"), b.get("kc"), b.get("vc"))
+        prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = self.tf32_scores
+        torch.baddbmm(b["sc"], b["qp"], b["kp"].transpose(1, 2), beta=0.0, alpha=sm_scale, out=b["sc"])
+        dense = index in cfg["dense_layers"]
+        k.topk_rows(b["sc"], L.n_tiles, L.n_ext, cfg["prefix_tiles"], cfg["starts"], cfg["ends"],
+                    cfg["dense_ks"] if dense else cfg["sparse_ks"], b["idx"], b["num"], split)
+        oc, lse2 = None, b.get("lse2")
+        if gate_entry is not None:
+            oc = torch.bmm(torch.softmax(b["sc"], dim=-1), b["vp"]).to(x.dtype)
+        torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+        if L.tile == 128 and self.pair128:
+            # each 128-key block as two 64-key blocks selected by both halves of the 128-row tile
+            torch.stack([2 * b["idx"], 2 * b["idx"] + 1], -1, out=b["uidx"].view(*b["idx"].shape, 2))
+            torch.mul(b["num"], 2, out=b["unum"])
+            eight = self.fp8_attn
+            scale = sm_scale * (s_q * s_k if eight and not self.qk16 else 1.0)
+            if split:
+                self._dense_prefix(index, L, s_q, s_k)
+            out = k.vsa_pair(b["qb"], b["kb"], b["vb"], b["uidx"], b["umem"], b["unum"], b["vbs64"], scale,
+                             b["vs_blk"] if eight else None, b["vs_head"] if eight else None, b.get("lse2"))
+        elif self.fp8_attn:
+            coef = sm_scale * math.log2(math.e) * (1.0 if self.qk16 else s_q * s_k)
+            if split:
+                self._dense_prefix(index, L, s_q, s_k)
+            out = k.vsa_fp8(b["qb"], b["kb"], b["vb"], b["idx"], b["num"], L.vbs_ext, coef, b["vs_blk"],
+                            b["vs_head"], b.get("lse2"))
+        elif split:
+            self._dense_prefix(index, L, 1.0, 1.0)
+            out, lse2 = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, True)
+        else:
+            out = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, False)[0]
+        k.attn_gate_quant(out, g if gate_entry is not None else None, hs if gate_entry is not None else None, oc, L.slot,
+                          L.n_tiles, L.tile, a, a_sf, as_, L.rows, b.get("o1"), b.get("lse1a"), b.get("lse1b"),
+                          lse2)
+        self._gemm(a, a_sf, attn.to_out, y)
+        k.resid_norm_quant(x, y, as_, gate_msa, L.adaln, block.norm2.weight, shift_mlp, scale_mlp, x, h, h_sf, hs,
+                           block.norm2.eps)
+        self._gemm(h, h_sf, block.ff.fc_in, u)
+        k.swiglu_quant(u, hs, f, f_sf, fs)
+        self._gemm(f, f_sf, block.ff.fc_out, y)
+        if index + 1 < len(self.blocks):
+            nxt = self.blocks[index + 1]
+            tabs = nxt.adaln_proj(temb)
+            if not switch:
+                k.resid_norm_quant(x, y, fs, gate_mlp, L.adaln, nxt.norm1.weight, tabs[0].to(x.dtype),
+                                   tabs[1].to(x.dtype), x, h, h_sf, hs, nxt.norm1.eps)
+                return tabs, False
+        k.resid_norm_quant(x, y, fs, gate_mlp, L.adaln, None, None, None, x, None, None, None, 0.0)
+        return tabs, True

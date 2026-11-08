@@ -1,0 +1,35 @@
+{
+  "label": "tr-omni-768p-5s",
+  "service": "omni",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "first_s": 14.66,
+  "done_s": 14.623,
+  "fetched_s": 14.632,
+  "pipeline_s": 14.438,
+  "runs_done": [
+    14.63,
+    14.62,
+    14.67,
+    14.62,
+    14.62,
+    14.65
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 80.2,
+    "conditioning_stage": 571.2,
+    "latent_preparation_stage": 634.4,
+    "denoising_stage": 12080.7,
+    "video_decoding_stage": 997.6,
+    "audio_decoding_stage": 68.6
+  },
+  "samples": [
+    "video_gen_639ee8debd5746908996e5b25ff2ce63.mp4",
+    "video_gen_424b4f7210d0454880cf824fc42ecbe7.mp4",
+    "video_gen_23429489215e4725bbb605921bfd25f0.mp4",
+    "video_gen_9d23ac24257749c486647a0824423dcd.mp4",
+    "video_gen_36c7a28c5cef4f91bdaaf5304b9451a4.mp4",
+    "video_gen_a2315a5b772c4876be1b33b7a3218013.mp4"
+  ]
+}

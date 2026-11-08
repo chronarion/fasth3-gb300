@@ -755,6 +755,29 @@ __global__ void __launch_bounds__(256) v_to_fp8(const bf16* __restrict__ v, cons
   *reinterpret_cast<uint2*>(o + i * 8) = w;
 }
 
+// NVFP4 rows back to BF16 in the GEMM's own units (each e2m1 value times its 16-block's E4M3 scale; the row scale is
+// applied downstream): the input of a LoRA side branch beside an NVFP4 GEMM. One thread per 16-element block.
+__global__ void __launch_bounds__(256) fp4_dequant(const uint8_t* __restrict__ q, const uint8_t* __restrict__ sfb,
+                                                   int64_t rows, int width, bf16* __restrict__ o) {
+  const int sf_cols = width / 16;
+  const int64_t i = (int64_t)blockIdx.x * 256 + threadIdx.x;
+  if (i >= rows * sf_cols) return;
+  const int64_t row = i / sf_cols;
+  const int col = (int)(i % sf_cols);
+  const float s = e4m3_value(sfb[sf_offset(row, col, sf_cols)]);
+  const uint2 w = *reinterpret_cast<const uint2*>(q + row * (width / 2) + col * 8);
+  const float lut[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  __align__(16) bf16 out[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const uint32_t nib = ((j < 8 ? w.x : w.y) >> (4 * (j & 7))) & 0xFu;
+    out[j] = __float2bfloat16((nib & 8u) ? -lut[nib & 7u] * s : lut[nib & 7u] * s);
+  }
+  uint4* dst = reinterpret_cast<uint4*>(o + row * width + col * 16);
+  dst[0] = *reinterpret_cast<const uint4*>(out);
+  dst[1] = *reinterpret_cast<const uint4*>(out + 8);
+}
+
 // value * silu(gate) of the packed fc_in output (value half first), FP8 with a row scale.
 template <int F, bool FP4>
 __global__ void __launch_bounds__(F / 16) swiglu_quant(const bf16* __restrict__ u, const float* __restrict__ su,
@@ -1014,6 +1037,15 @@ void v_to_fp8_op(torch::Tensor v, torch::Tensor vs_head, torch::Tensor o) {
       ptr<bf16>(v), ptr<float>(vs_head), (int)vs_head.numel(), n8, ptr<uint8_t>(o));
 }
 
+void fp4_dequant_op(torch::Tensor q, torch::Tensor sf, torch::Tensor o) {
+  const at::cuda::OptionalCUDAGuard guard(device_of(q));
+  const int64_t rows = q.size(0);
+  const int width = (int)(q.size(1) * 2);
+  const int64_t n = rows * (width / 16);
+  fp4_dequant<<<(unsigned)((n + 255) / 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      ptr<uint8_t>(q), ptr<uint8_t>(sf), rows, width, ptr<bf16>(o));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("resid_norm_quant", &resid_norm_quant_op);
   m.def("qkv_prologue", &qkv_prologue_op);
@@ -1025,4 +1057,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("topk_pairs", &topk_pairs_op);
   m.def("vsa_pair", &vsa_pair_op);
   m.def("v_to_fp8", &v_to_fp8_op);
+  m.def("fp4_dequant", &fp4_dequant_op);
 }

@@ -50,7 +50,11 @@ def main() -> None:
     ap.add_argument("--frames", type=int)
     ap.add_argument("--ref", default=None, help="reference image for Omni (path the server can read)")
     ap.add_argument("--prompt-file", default=None)
+    ap.add_argument("--reroll", action="store_true", help="every clip repeats the first prompt (re-rolls); by default "
+                    "long prompts get a distinct 'Take N.' prefix per clip")
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--lora", default=None, help="LoRA adapter name (a file in serve/loras without .safetensors)")
+    ap.add_argument("--lora-scale", type=float, default=None, help="LoRA strength (the adapter's default when unset)")
     ap.add_argument("--url", default="http://127.0.0.1:8101/v1")
     ap.add_argument("--container", default=None, help="container whose logs carry the stage times "
                     "(default fasth3-SERVICE; '' skips them)")
@@ -61,10 +65,10 @@ def main() -> None:
         ap.error("--ref is required for the omni service")
     if a.prompt_file:
         text = open(a.prompt_file).read().strip()
-        prompts = [f"Take {i + 1}. {text}" for i in range(a.n + 1)]
+        prompts = [text if a.reroll else f"Take {i + 1}. {text}" for i in range(a.n + 1)]
     else:
         base = OMNI_PROMPTS if omni else T2V_PROMPTS
-        prompts = [base[0]] + [base[1 + i % 3] for i in range(a.n)]
+        prompts = [base[0]] * (a.n + 1) if a.reroll else [base[0]] + [base[1 + i % 3] for i in range(a.n)]
     container = f"fasth3-{a.service}" if a.container is None else a.container
 
     def call(path: str, body: dict | None = None) -> dict:
@@ -82,6 +86,8 @@ def main() -> None:
                 body[key] = value
         if omni:
             body["image_reference"] = [{"image_url": a.ref}]
+        if a.lora:
+            body["lora"] = {"name": a.lora} if a.lora_scale is None else {"name": a.lora, "scale": a.lora_scale}
         t0 = time.time()
         job = call("/videos", body)
         while job["status"] not in ("completed", "failed"):
@@ -118,7 +124,8 @@ def main() -> None:
         "label": a.label, "service": a.service,
         "size": f"{a.width}x{a.height}" if a.width and a.height else "server default",
         "frames": a.frames or "server default",
-        "prompt": os.path.basename(a.prompt_file) if a.prompt_file else "short",
+        "prompt": (os.path.basename(a.prompt_file) if a.prompt_file else "short") + (", re-roll" if a.reroll else ""),
+        "lora": None if not a.lora else f"{a.lora} @ {a.lora_scale if a.lora_scale is not None else 'default'}",
         "first_s": round(first, 2),
         "done_s": med(done), "fetched_s": med(fetched), "pipeline_s": med(pipeline),
         "runs_done": [round(x, 2) for x in done],

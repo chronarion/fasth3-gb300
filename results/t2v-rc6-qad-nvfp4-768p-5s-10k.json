@@ -1,0 +1,30 @@
+{
+  "label": "rc6-qad-nvfp4-768p-5s-10k",
+  "service": "t2v",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "long-10k.txt",
+  "lora": null,
+  "first_s": 19.31,
+  "done_s": 16.047,
+  "fetched_s": 16.059,
+  "pipeline_s": 15.876,
+  "runs_done": [
+    16.06,
+    16.04,
+    16.05
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 544.7,
+    "latent_preparation_stage": 25.5,
+    "denoising_stage": 14238.7,
+    "video_decoding_stage": 998.4,
+    "audio_decoding_stage": 69.3
+  },
+  "samples": [
+    "video_gen_3d4faf64476545a19d2d1bb10af489e5.mp4",
+    "video_gen_6a4699ea9412431785fa50368225a5c3.mp4",
+    "video_gen_47031fa57ca845129df6f17d2003bb1c.mp4"
+  ]
+}

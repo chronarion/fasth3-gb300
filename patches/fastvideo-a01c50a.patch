@@ -1,5 +1,5 @@
 diff --git a/fastvideo/entrypoints/video_generator.py b/fastvideo/entrypoints/video_generator.py
-index dc52f44..a709af6 100644
+index dc52f44..99529bd 100644
 --- a/fastvideo/entrypoints/video_generator.py
 +++ b/fastvideo/entrypoints/video_generator.py
 @@ -6,11 +6,11 @@ This module provides a consolidated interface for generating videos using
@@ -40,23 +40,61 @@ index dc52f44..a709af6 100644
          except BaseException:  # noqa: BLE001
              # Ctrl-C lands in the main thread while the in-process forward pass
              # keeps running in `execute_forward_thread`; flag the pipeline so the
-@@ -1116,6 +1121,7 @@ class VideoGenerator:
+@@ -1110,13 +1115,18 @@ class VideoGenerator:
+                     # second-pass remux overhead. AudioMuxStage remains 0.0 on
+                     # success because audio is already present in the saved MP4.
+                     save_start = time.perf_counter()
++                    yuv_stream = output_batch.extra.pop("yuv_stream", None)
+                     save_ok = self._save_video_with_audio_ffmpeg_pipe(
+                         output_path=output_path,
+                         frames=frames,
                          fps=save_fps,
                          audio=audio,
                          sample_rate=int(audio_sample_rate),
 +                        yuv420p=output_batch.extra.get("yuv420p"),
++                        yuv_stream=yuv_stream,
                      )
++                    if yuv_stream is not None and not yuv_stream.done:
++                        yuv_stream.abort()
                      if not save_ok:
                          logger.warning("ffmpeg pipe save failed; trying PyAV single-pass save.")
-@@ -1347,6 +1353,7 @@ class VideoGenerator:
+                         save_ok = self._save_video_with_audio_single_pass(
+@@ -1347,8 +1357,13 @@ class VideoGenerator:
          fps: int,
          audio: torch.Tensor | np.ndarray,
          sample_rate: int,
 +        yuv420p: torch.Tensor | None = None,
++        yuv_stream: Any = None,
      ) -> bool:
-         """Encode video+audio using ffmpeg via rawvideo stdin + WAV input."""
+-        """Encode video+audio using ffmpeg via rawvideo stdin + WAV input."""
++        """Encode video+audio using ffmpeg via rawvideo stdin + WAV input.
++
++        ``yuv_stream`` (a MiniMax-H3 ``YuvStreamEncoder``) has encoded the video during the decode already; then only
++        the audio is encoded and muxed beside it, and a failed stream falls back to encoding ``yuv420p`` here."""
          ffmpeg_bin = shutil.which(envs.FASTVIDEO_FFMPEG_BIN.get())
-@@ -1379,7 +1386,7 @@ class VideoGenerator:
+         if ffmpeg_bin is None:
+             logger.warning("ffmpeg not found; cannot use ffmpeg pipe save.")
+@@ -1370,6 +1385,19 @@ class VideoGenerator:
+                     logger.warning("Unexpected audio tensor for ffmpeg pipe save: %s", e)
+                     return False
+ 
++                video_path = yuv_stream.finish() if yuv_stream is not None else None
++                if video_path is not None:
++                    try:
++                        mux = [
++                            ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-i", wav_path,
++                            "-c:v", "copy", "-c:a", "aac", "-af", "apad", "-t",
++                            str(len(frames) / fps), "-movflags", "+faststart", output_path
++                        ]
++                        if subprocess.run(mux, check=False).returncode == 0:
++                            return True
++                        logger.warning("Muxing the streamed video failed; encoding again")
++                    finally:
++                        yuv_stream.cleanup()
+                 cmd = [
+                     ffmpeg_bin,
+                     "-hide_banner",
+@@ -1379,7 +1407,7 @@ class VideoGenerator:
                      "-f",
                      "rawvideo",
                      "-pix_fmt",
@@ -65,7 +103,7 @@ index dc52f44..a709af6 100644
                      "-s:v",
                      f"{width}x{height}",
                      "-r",
-@@ -1436,8 +1443,11 @@ class VideoGenerator:
+@@ -1436,8 +1464,11 @@ class VideoGenerator:
  
                  try:
                      ts_start = time.perf_counter()
@@ -80,16 +118,19 @@ index dc52f44..a709af6 100644
                      logger.info("Wrote frames to ffmpeg stdin in %.3f s", time.perf_counter() - ts_start)
                      rc = proc.wait()
 diff --git a/fastvideo/envs.py b/fastvideo/envs.py
-index 9eea7df..30e4993 100644
+index 9eea7df..36bb5cf 100644
 --- a/fastvideo/envs.py
 +++ b/fastvideo/envs.py
-@@ -682,6 +682,15 @@ FASTVIDEO_H3_VSA_HEADS_FIRST_TILE = EnvBool(False,
+@@ -682,6 +682,18 @@ FASTVIDEO_H3_VSA_HEADS_FIRST_TILE = EnvBool(False,
                                              doc="VSA-H3 64/128-token tiles: scatter rows straight into the heads-first "
                                              "layout the sparse kernels read, removing their per-call transpose copy "
                                              "of query, key and value. Bit-identical; no-grad, uncompiled CUDA only.")
 +FASTVIDEO_H3_YUV_OUT = EnvBool(False,
 +                               category="performance",
 +                               doc="Convert decoded MiniMax-H3 frames to yuv420p on the GPU and pipe them to ffmpeg, which is slow at RGB conversion on aarch64.")
++FASTVIDEO_H3_YUV_STREAM = EnvBool(False,
++                                  category="performance",
++                                  doc="With FASTVIDEO_H3_YUV_OUT: encode the H.264 video while the VAE decodes the rest of the clip (each finalized chunk goes to ffmpeg as it lands); saving then only muxes the audio.")
 +FASTVIDEO_H3_FAST = EnvBool(False,
 +                            category="performance",
 +                            doc="Run MiniMax-H3 FP8 DiT blocks on the fused single-GPU path (fastvideo/models/dits/h3fast).")
@@ -99,16 +140,187 @@ index 9eea7df..30e4993 100644
  FASTVIDEO_H3_VSA_TILE_FIRST = EnvBool(False,
                                        category="attention",
                                        doc="Single-rank MiniMax-H3 VSA with one tile gather of the block input "
+diff --git a/fastvideo/fastvideo_args.py b/fastvideo/fastvideo_args.py
+index 7024fe7..5464513 100644
+--- a/fastvideo/fastvideo_args.py
++++ b/fastvideo/fastvideo_args.py
+@@ -12,6 +12,7 @@ from typing import Any, TYPE_CHECKING
+ 
+ from fastvideo.configs.configs import PreprocessConfig
+ from fastvideo.configs.pipelines.base import PipelineConfig
++from fastvideo.configs.pipelines.minimax_h3_token_reduction import MiniMaxH3TokenReductionSchedule
+ from fastvideo.configs.utils import clean_cli_args
+ from fastvideo.layers.quantization import QUANTIZATION_METHODS, QuantizationMethods
+ from fastvideo.logger import init_logger
+@@ -296,6 +297,11 @@ class FastVideoArgs:
+     inference_torch_compile: bool = False
+ 
+     h3_vsa_fp4: dict[str, Any] = field(default_factory=dict)
++    # Training-free horizontal pairing of MiniMax-H3's generated-video tokens in
++    # the middle DiT blocks (antirez/h3.c --token-reduction). Keys: enabled,
++    # blocks [BEGIN, END], early [STEPS, END], update_scale. See
++    # fastvideo/configs/pipelines/minimax_h3_token_reduction.py.
++    h3_token_reduction: dict[str, Any] = field(default_factory=dict)
+ 
+     disable_autocast: bool = False
+ 
+@@ -453,6 +459,8 @@ class FastVideoArgs:
+             raise ValueError("h3_vsa_fp4.prefix_precision must be empty, fp8 or bf16")
+         if self.h3_vsa_fp4.get("enabled") and (self.inference_torch_compile or self.enable_torch_compile):
+             raise ValueError("h3_vsa_fp4 requires eager DiT inference; disable DiT torch.compile")
++        # The DiT depth is checked against the checkpoint's own config when the transformer loads.
++        MiniMaxH3TokenReductionSchedule.from_options(self.h3_token_reduction)
+         self._fold_vae_parallel_env()
+         self._fold_h3_encoder_split_env()
+         # Runs after FASTVIDEO_ATTENTION_BACKEND is copied into attention_backend,
 diff --git a/fastvideo/models/dits/minimax_h3.py b/fastvideo/models/dits/minimax_h3.py
-index 06ad52e..8d6869b 100644
+index 06ad52e..388c22f 100644
 --- a/fastvideo/models/dits/minimax_h3.py
 +++ b/fastvideo/models/dits/minimax_h3.py
-@@ -1326,6 +1326,29 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -38,6 +38,8 @@ from fastvideo.logger import init_logger
+ from fastvideo.models.dits.base import BaseDiT
+ from fastvideo.models.dits.minimax_h3_vsa_fp4 import (STAGES, vsa_fp4_attention, vsa_fp4_attention_sp,
+                                                        vsa_fp4_requested, vsa_tile_first_attention)
++from fastvideo.models.dits.minimax_h3_token_reduction import (MiniMaxH3TokenReduction, expand_token_pairs,
++                                                              pool_token_pairs)
+ from fastvideo.models.dits.minimax_h3_fusions import exact as exact_kernels
+ from fastvideo.models.dits.minimax_h3_fusions import mk as mk_kernels
+ from fastvideo.models.dits.minimax_h3_fusions import (
+@@ -967,6 +969,7 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+         # per-generation caches for loop-invariant work (see _rotary_for /
+         # _refined_text); plain attrs, never in state_dict
+         self._rope_cache: tuple | None = None
++        self._reduced_rope_cache: tuple | None = None
+         self._text_cache: tuple | None = None
+         self.token_refiner = MiniMaxH3TokenRefiner(
+             arch.hidden_size,
+@@ -1229,24 +1232,61 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+                                  (2 * arch.rope_freq_dim)))
+             self.rope._buffers["inv_freq"] = inv_freq
+ 
+-    def _rotary_for(self, position_ids: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
++    def _rotary_for(self,
++                    position_ids: torch.Tensor,
++                    dtype: torch.dtype,
++                    cache_name: str = "_rope_cache") -> tuple[torch.Tensor, torch.Tensor]:
+         """cos/sin depend only on positions; the denoising stage holds one
+         position_ids tensor for the whole loop, so cache per layout and
+         pre-cast once instead of rebuilding every step and re-casting in
+         every block. Holding the source tensor keeps the identity check safe
+-        against id reuse."""
++        against id reuse. Token reduction keeps its pair positions in a
++        second slot so the two layouts do not evict each other."""
+         if torch.compiler.is_compiling():
+             cos, sin = self.rope(position_ids)
+             return cos.to(dtype), sin.to(dtype)
+-        cached = self._rope_cache
++        cached = getattr(self, cache_name)
+         if (cached is not None and cached[0] is position_ids and cached[1] == dtype
+                 and cached[2][0].device == position_ids.device):
+             return cached[2]
+         cos, sin = self.rope(position_ids)
+         value = (cos.to(dtype), sin.to(dtype))
+-        self._rope_cache = (position_ids, dtype, value)
++        setattr(self, cache_name, (position_ids, dtype, value))
+         return value
+ 
++    def _enter_token_reduction(self, packed_hidden_states: torch.Tensor, plan: MiniMaxH3TokenReduction,
++                               sequence_length: int,
++                               sp_world_size: int) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
++        """Pool video pairs; returns the reduced block input and the full rows plus pooled baseline to restore from.
++
++        Under sequence parallelism pooling changes how many rows each rank
++        holds, so the full sequence is gathered, pooled and sharded again.
++        """
++        with nvtx_range("minimax_h3.token_reduction.pool"):
++            if sp_world_size > 1:
++                packed_hidden_states = sequence_model_parallel_all_gather_with_unpad(packed_hidden_states,
++                                                                                      sequence_length,
++                                                                                      dim=1)
++            pooled = pool_token_pairs(packed_hidden_states, plan)
++            reduced = pooled
++            if sp_world_size > 1:
++                reduced = self._block_input(sequence_model_parallel_shard(pooled, dim=1)[0])
++        return reduced, (packed_hidden_states, pooled)
++
++    def _leave_token_reduction(self, packed_hidden_states: torch.Tensor, saved: tuple[torch.Tensor, torch.Tensor],
++                               plan: MiniMaxH3TokenReduction, sp_world_size: int) -> torch.Tensor:
++        """Restore the full sequence from the reduced stack's output."""
++        original, pooled = saved
++        with nvtx_range("minimax_h3.token_reduction.expand"):
++            if sp_world_size > 1:
++                packed_hidden_states = sequence_model_parallel_all_gather_with_unpad(packed_hidden_states,
++                                                                                      plan.reduced_length,
++                                                                                      dim=1)
++            restored = expand_token_pairs(original, packed_hidden_states, pooled, plan)
++            if sp_world_size > 1:
++                restored = self._block_input(sequence_model_parallel_shard(restored, dim=1)[0])
++        return restored
++
+     def attach_step_splice(self, late: nn.Module, from_step: int) -> None:
+         """Hand denoising steps ``from_step`` onward to ``late`` (same architecture, other weights).
+ 
+@@ -1326,6 +1366,84 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
              self._text_cache = (encoder_hidden_states, text_embeds, text_attn_metadata)
          return text_embeds
  
++    def _block_loop(self, packed_hidden_states: torch.Tensor, temb: torch.Tensor, adaln_indices: torch.Tensor,
++                    rotary_emb: tuple[torch.Tensor, torch.Tensor], original_seq_len: int, sp_world_size: int,
++                    reduction: tuple | None) -> torch.Tensor:
++        """The stock block loop; ``reduction`` = (plan, reduced rotary, reduced AdaLN indices) or None."""
++        token_reduction, reduced_rotary_emb, reduced_adaln_indices = reduction or (None, None, None)
++        # Reduced blocks attend over the shorter sequence, so they read its own
++        # attention metadata from the forward context; the full one is put back
++        # on exit and on error.
++        forward_context = get_forward_context() if token_reduction is not None else None
++        full_attn_metadata = forward_context.attn_metadata if forward_context is not None else None
++        reduction_saved = None
++        try:
++            # The eager driver owns profiling markers while each block's compiled
++            # forward owns the graph that the marker surrounds.
++            for block_index, block in enumerate(self.transformer_blocks):
++                if token_reduction is not None and block_index == token_reduction.begin:
++                    assert forward_context is not None
++                    packed_hidden_states, reduction_saved = self._enter_token_reduction(
++                        packed_hidden_states, token_reduction, original_seq_len, sp_world_size)
++                    forward_context.attn_metadata = token_reduction.attn_metadata
++                if token_reduction is not None and block_index == token_reduction.end:
++                    assert forward_context is not None and reduction_saved is not None
++                    packed_hidden_states = self._leave_token_reduction(packed_hidden_states, reduction_saved,
++                                                                       token_reduction, sp_world_size)
++                    forward_context.attn_metadata = full_attn_metadata
++                    reduction_saved = None
++                if reduction_saved is None:
++                    block_adaln_indices, block_rotary_emb, block_seq_len = adaln_indices, rotary_emb, original_seq_len
++                else:
++                    assert token_reduction is not None and reduced_adaln_indices is not None
++                    assert reduced_rotary_emb is not None
++                    block_adaln_indices, block_rotary_emb = reduced_adaln_indices, reduced_rotary_emb
++                    block_seq_len = token_reduction.reduced_length
++                if STAGES.enabled:
++                    logger.info("H3_MEMORY_BLOCK %d allocated=%.3f GiB reserved=%.3f GiB", block_index,
++                                torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30)
++                with nvtx_range(f"minimax_h3.transformer_block.{block_index}"), STAGES.span("block_total"):
++                    packed_hidden_states = block(
++                        packed_hidden_states,
++                        temb,
++                        block_adaln_indices,
++                        block_rotary_emb,
++                        block_seq_len,
++                    )
++            if reduction_saved is not None:
++                assert token_reduction is not None
++                packed_hidden_states = self._leave_token_reduction(packed_hidden_states, reduction_saved,
++                                                                   token_reduction, sp_world_size)
++                reduction_saved = None
++        finally:
++            if forward_context is not None:
++                forward_context.attn_metadata = full_attn_metadata
++        return packed_hidden_states
++
 +    def _h3_fast_forward(self, packed: torch.Tensor, temb: torch.Tensor, adaln_indices: torch.Tensor,
-+                         rotary_emb: tuple[torch.Tensor, torch.Tensor], sp_world_size: int) -> torch.Tensor | None:
++                         rotary_emb: tuple[torch.Tensor, torch.Tensor], sp_world_size: int,
++                         reduction: tuple | None = None) -> torch.Tensor | None:
 +        """All blocks on the fused path, or None when this forward needs the stock loop."""
 +        if (not envs.FASTVIDEO_H3_FAST.get() or sp_world_size != 1 or torch.is_grad_enabled()
 +                or torch.compiler.is_compiling() or packed.shape[0] != 1):
@@ -117,14 +329,14 @@ index 06ad52e..8d6869b 100644
 +        meta = get_forward_context().attn_metadata
 +        if not H3FastRunner.supported(self, meta):
 +            return None
++        if reduction is not None and not H3FastRunner.supported(self, reduction[0].attn_metadata):
++            return None
 +        runner = self.__dict__.get("_h3_fast_runner")
 +        if runner is None:
 +            runner = self.__dict__["_h3_fast_runner"] = H3FastRunner(self)
-+        out = runner.forward(packed, temb, adaln_indices, rotary_emb, meta)
++        out = runner.forward(packed, temb, adaln_indices, rotary_emb, meta, reduction)
 +        if envs.FASTVIDEO_H3_FAST_CHECK.get():
-+            ref = packed
-+            for block in self.transformer_blocks:
-+                ref = block(ref, temb, adaln_indices, rotary_emb, packed.shape[1])
++            ref = self._block_loop(packed, temb, adaln_indices, rotary_emb, packed.shape[1], 1, reduction)
 +            rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
 +            logger.info("H3_FAST_CHECK rel_l2=%.5f out_norm=%.1f ref_norm=%.1f", rel, out.float().norm().item(),
 +                        ref.float().norm().item())
@@ -133,22 +345,126 @@ index 06ad52e..8d6869b 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -1407,9 +1430,12 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1339,13 +1457,18 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+         audio_indices: torch.Tensor,
+         text_indices: torch.Tensor,
+         text_attn_metadata: AttentionMetadata | None = None,
++        token_reduction: MiniMaxH3TokenReduction | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Predict video and audio velocities from one caller-defined packed layout."""
++        """Predict video and audio velocities from one caller-defined packed layout.
++
++        ``token_reduction`` (inference only) runs blocks ``[begin, end)`` on
++        horizontally paired generated-video rows; see minimax_h3_token_reduction.
++        """
+         late = self.__dict__.get("_splice_late")
+         if late is not None and get_forward_context().current_timestep >= self._splice_from_step:
+             return late(hidden_states, audio_hidden_states, encoder_hidden_states, timestep, timestep_indices,
+                         token_tags, position_ids, video_indices, audio_indices, text_indices,
+-                        text_attn_metadata=text_attn_metadata)
++                        text_attn_metadata=text_attn_metadata, token_reduction=token_reduction)
+         if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
+             raise ValueError(f"position_ids must have shape (seq_len, 3), got {tuple(position_ids.shape)}.")
+         sequence_length = position_ids.shape[0]
+@@ -1357,6 +1480,15 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+             raise ValueError("audio_hidden_states row count must match audio_indices.")
+         if encoder_hidden_states.shape[1] != text_indices.numel():
+             raise ValueError("encoder_hidden_states row count must match text_indices.")
++        if token_reduction is not None:
++            if torch.is_grad_enabled():
++                raise ValueError("MiniMax H3 token reduction is inference-only.")
++            if token_reduction.sequence_length != sequence_length:
++                raise ValueError(f"Token reduction was built for {token_reduction.sequence_length} rows, "
++                                 f"the packed sequence has {sequence_length}.")
++            if not 0 <= token_reduction.begin < token_reduction.end <= len(self.transformer_blocks):
++                raise ValueError(f"Token reduction blocks {token_reduction.begin}:{token_reduction.end} must lie in "
++                                 f"0:{len(self.transformer_blocks)}.")
+ 
+         video_embeds, _ = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
+         audio_embeds, _ = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.weight.dtype))
+@@ -1371,6 +1503,8 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+         pad_tokens = sequence_length - real_tokens
+         if pad_tokens < 0:
+             raise ValueError("Real H3 token counts exceed the packed sequence length")
++        if pad_tokens and token_reduction is not None:
++            raise ValueError("MiniMax H3 token reduction does not support capacity padding rows.")
+         if pad_tokens:
+             metadata = get_forward_context().attn_metadata
+             packed_sequence = getattr(metadata, "packed_sequence", None)
+@@ -1391,6 +1525,12 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags
+         local_timestep_indices = timestep_indices
+         original_seq_len = sequence_length
++        reduced_rotary_emb = reduced_adaln_indices = None
++        if token_reduction is not None:
++            # A pair takes its first source's modulation row and the mean of both positions.
++            reduced_rotary_emb = self._rotary_for(token_reduction.position_ids, text_embeds.dtype,
++                                                  "_reduced_rope_cache")
++            reduced_adaln_indices = adaln_indices.index_select(0, token_reduction.first)
+ 
+         if sp_world_size > 1:
+             packed_hidden_states = self._block_input(sequence_model_parallel_shard(packed_hidden_states, dim=1)[0])
+@@ -1399,6 +1539,10 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+             adaln_indices, _ = sequence_model_parallel_shard(adaln_indices, dim=0)
+             local_timestep_indices, _ = sequence_model_parallel_shard(local_timestep_indices, dim=0)
+             rotary_emb = (rotary_cos, rotary_sin)
++            if reduced_rotary_emb is not None:
++                reduced_rotary_emb = (sequence_model_parallel_shard(reduced_rotary_emb[0], dim=0)[0],
++                                      sequence_model_parallel_shard(reduced_rotary_emb[1], dim=0)[0])
++                reduced_adaln_indices, _ = sequence_model_parallel_shard(reduced_adaln_indices, dim=0)
+ 
+         if getattr(self, "_adaln_host_cache", False):
+             # One host read per forward keys every block's modulation cache by the timestep values.
+@@ -1407,20 +1551,14 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
                  block.adaln_proj._cache_key = key
              self._move_adaln_tables(temb.device)
  
-+        fast_out = self._h3_fast_forward(packed_hidden_states, temb, adaln_indices, rotary_emb, sp_world_size)
+-        # The eager driver owns profiling markers while each block's compiled
+-        # forward owns the graph that the marker surrounds.
+-        for block_index, block in enumerate(self.transformer_blocks):
+-            if STAGES.enabled:
+-                logger.info("H3_MEMORY_BLOCK %d allocated=%.3f GiB reserved=%.3f GiB", block_index,
+-                            torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30)
+-            with nvtx_range(f"minimax_h3.transformer_block.{block_index}"), STAGES.span("block_total"):
+-                packed_hidden_states = block(
+-                    packed_hidden_states,
+-                    temb,
+-                    adaln_indices,
+-                    rotary_emb,
+-                    original_seq_len,
+-                )
++        reduction = None if token_reduction is None else (token_reduction, reduced_rotary_emb, reduced_adaln_indices)
++        fast_out = self._h3_fast_forward(packed_hidden_states, temb, adaln_indices, rotary_emb, sp_world_size,
++                                         reduction)
 +        if fast_out is not None:
 +            packed_hidden_states = fast_out
-         # The eager driver owns profiling markers while each block's compiled
-         # forward owns the graph that the marker surrounds.
--        for block_index, block in enumerate(self.transformer_blocks):
-+        for block_index, block in enumerate(() if fast_out is not None else self.transformer_blocks):
-             if STAGES.enabled:
-                 logger.info("H3_MEMORY_BLOCK %d allocated=%.3f GiB reserved=%.3f GiB", block_index,
-                             torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30)
++        else:
++            packed_hidden_states = self._block_loop(packed_hidden_states, temb, adaln_indices, rotary_emb,
++                                                    original_seq_len, sp_world_size, reduction)
+ 
+         packed_hidden_states = self.norm_out(
+             packed_hidden_states,
+diff --git a/fastvideo/models/loader/component_loader.py b/fastvideo/models/loader/component_loader.py
+index 9c9ffb9..06c6bc6 100644
+--- a/fastvideo/models/loader/component_loader.py
++++ b/fastvideo/models/loader/component_loader.py
+@@ -1241,6 +1241,14 @@ class TransformerLoader(ComponentLoader):
+             if not isinstance(dit_config, MiniMaxH3Config):
+                 raise ValueError("h3_vsa_fp4 is only supported by MiniMax-H3")
+             dit_config.vsa_fp4 = dict(fastvideo_args.h3_vsa_fp4)
++        token_reduction = getattr(fastvideo_args, "h3_token_reduction", None)
++        if token_reduction and token_reduction.get("enabled"):
++            from fastvideo.configs.models.dits.minimax_h3 import MiniMaxH3Config
++            from fastvideo.configs.pipelines.minimax_h3_token_reduction import MiniMaxH3TokenReductionSchedule
++            if not isinstance(dit_config, MiniMaxH3Config):
++                raise ValueError("h3_token_reduction is only supported by MiniMax-H3")
++            # The checkpoint's own config fixes the DiT depth; reject intervals past it before any weight loads.
++            MiniMaxH3TokenReductionSchedule.from_options(token_reduction, num_blocks=dit_config.arch_config.num_layers)
+ 
+         # Generator-only QAT for DMD distillation: the teacher (real_score) and
+         # critic (fake_score) transformers load with this flag set and must stay
 diff --git a/fastvideo/models/vaes/minimax_h3_video.py b/fastvideo/models/vaes/minimax_h3_video.py
-index 8f72df9..836187c 100644
+index 8f72df9..e3b4766 100644
 --- a/fastvideo/models/vaes/minimax_h3_video.py
 +++ b/fastvideo/models/vaes/minimax_h3_video.py
 @@ -343,6 +343,17 @@ def _can_fuse_qk_norm_rope(
@@ -169,7 +485,7 @@ index 8f72df9..836187c 100644
  class MiniMaxH3VideoAttention(nn.Module):
  
      def __init__(self, dim: int, heads: int, dim_head: int, eps: float = 1e-5, bias: bool = True) -> None:
-@@ -1146,6 +1157,10 @@ class AutoencoderKLMiniMaxH3(nn.Module):
+@@ -1146,6 +1157,16 @@ class AutoencoderKLMiniMaxH3(nn.Module):
              num_frames = chunk.shape[2]
              pixels = self.denormalize_pixels(chunk.float()).clamp_(0, 1)
              self._copy_chunk_pixels(pixels, output, output_frame_start, non_blocking)
@@ -177,11 +493,17 @@ index 8f72df9..836187c 100644
 +            if yuv is not None:
 +                yuv[output_frame_start:output_frame_start + num_frames].copy_(_yuv420_planes(pixels),
 +                                                                              non_blocking=non_blocking)
++                ready = getattr(self, "yuv_chunk_ready", None)
++                if ready is not None:
++                    # The copy is queued on the current stream; the event marks these frames as landed on the host.
++                    event = torch.cuda.Event()
++                    event.record()
++                    ready(output_frame_start, num_frames, event)
              output_frame_start += num_frames
          if output_frame_start != output.shape[2]:
              raise RuntimeError(
 diff --git a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py
-index 667e9f8..2026cdf 100644
+index 667e9f8..752c203 100644
 --- a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py
 +++ b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py
 @@ -32,6 +32,18 @@ from fastvideo.pipelines.stages.validators import VerificationResult
@@ -203,7 +525,23 @@ index 667e9f8..2026cdf 100644
  def _token_ids(tokenized: Any) -> list[int]:
      input_ids = tokenized["input_ids"] if isinstance(tokenized, dict) else tokenized.input_ids
      if isinstance(input_ids, torch.Tensor):
-@@ -286,7 +298,7 @@ class MiniMaxH3ConditioningStage(PipelineStage):
+@@ -166,7 +178,15 @@ class MiniMaxH3ConditioningStage(PipelineStage):
+         images = batch.extra.get(MINIMAX_H3_KEYFRAMES_KEY, [])
+         if not isinstance(images, list):
+             raise TypeError("MiniMax-H3 keyframes must be a list.")
++        # The same prompt (and keyframes) again, e.g. a re-roll with a new seed: the encode is a pure function of its
++        # inputs, so the memo returns it exactly, as for Ref2VA presentations.
++        if self._ref2va_memo.enabled:
++            key = ("fl2va", str(device), batch.prompt, tuple(image_key(image) for image in images))
++            return self._ref2va_memo.get_or_compute(key, lambda: self._present_fl2va(batch, images, device))
++        return self._present_fl2va(batch, images, device)
+ 
++    def _present_fl2va(self, batch: ForwardBatch, images: list[Any],
++                       device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+         token_ids: list[int] = []
+         token_tags: list[int] = []
+         pixel_values = None
+@@ -286,7 +306,7 @@ class MiniMaxH3ConditioningStage(PipelineStage):
          try:
              # Keep both H3 prompt-presentation modes under one text-encoding
              # range so Nsight Systems exposes their complete conditioning cost.
@@ -213,10 +551,18 @@ index 667e9f8..2026cdf 100644
                      prompt_embeds, text_token_tags = self._encode_ref2va(batch, device)
                  else:
 diff --git a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py
-index ae764b6..95f216f 100644
+index ae764b6..c5c4ad4 100644
 --- a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py
 +++ b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py
-@@ -71,6 +71,7 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -14,6 +14,7 @@ from fastvideo.logger import init_logger
+ from fastvideo.models import pinned_offload
+ from fastvideo.models.vaes.minimax_h3_audio import MiniMaxH3AudioVAE
+ from fastvideo.models.vaes.minimax_h3_parallel import DEFAULT_DECODE_GATHER_STRATEGY, decode_to_pixels_parallel
++from fastvideo.pipelines.basic.minimax_h3.yuv_stream import YuvStreamEncoder
+ from fastvideo.models.vaes.minimax_h3_video import AutoencoderKLMiniMaxH3
+ from fastvideo.pipelines.basic.minimax_h3.encoder_split import h3_is_output_worker, h3_output_worker_rank
+ from fastvideo.profiler import nvtx_range
+@@ -71,6 +72,7 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
          self.vae = vae
          self._output_buffer: tuple[tuple[tuple[int, ...], bool, torch.dtype], torch.Tensor] | None = None
          self._unified_memory: bool | None = None
@@ -224,7 +570,7 @@ index ae764b6..95f216f 100644
  
      def _pixel_buffer(self,
                        shape: tuple[int, ...],
-@@ -99,6 +100,14 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -99,6 +101,14 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
              self._output_buffer = (key, buffer)
          return self._output_buffer[1]
  
@@ -239,7 +585,7 @@ index ae764b6..95f216f 100644
      def verify_input(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> VerificationResult:
          result = VerificationResult()
          result.add_check("layout", batch.extra.get(MINIMAX_H3_LAYOUT_KEY), V.not_none)
-@@ -174,11 +183,22 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -174,11 +184,27 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
                  return batch
  
              output = None
@@ -261,23 +607,83 @@ index ae764b6..95f216f 100644
 +                frames, height, width = shape[2:]
 +                yuv = self._pinned_buffer("yuv", (frames, height * width * 3 // 2), torch.uint8)
 +            self.vae.yuv_output = yuv
++            encoder = None
++            if yuv is not None and YuvStreamEncoder.supported():
++                fps = batch.extra.get("output_fps") or (batch.fps[0] if isinstance(batch.fps, list) else batch.fps)
++                encoder = YuvStreamEncoder(yuv, shape[-1], shape[-2], int(fps or 24))
++            self.vae.yuv_chunk_ready = None if encoder is None else encoder.chunk_ready
              # Attribute the streamed decoder computation while retaining
              # per-chunk device-to-host transfer and pinned-buffer reuse.
              # fp16 for the release decoders; NVFP4 decoders were trained under bf16.
-@@ -204,6 +224,8 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -187,13 +213,20 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+                     nvtx_range("minimax_h3.vae"),
+                     torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=device.type == "cuda"),
+             ):
+-                if parallel:
+-                    strategy = fastvideo_args.vae_parallel_decode_strategy or DEFAULT_DECODE_GATHER_STRATEGY
+-                    logger.info("MiniMax-H3 VAE decode: sequence-parallel chunks across %d ranks (%s)",
+-                                sp_group.world_size, strategy)
+-                    decode_to_pixels_parallel(self.vae, latents, output, sp_group, strategy=strategy)
+-                else:
+-                    self.vae.decode_to_pixels(latents, output)
++                try:
++                    if parallel:
++                        strategy = fastvideo_args.vae_parallel_decode_strategy or DEFAULT_DECODE_GATHER_STRATEGY
++                        logger.info("MiniMax-H3 VAE decode: sequence-parallel chunks across %d ranks (%s)",
++                                    sp_group.world_size, strategy)
++                        decode_to_pixels_parallel(self.vae, latents, output, sp_group, strategy=strategy)
++                    else:
++                        self.vae.decode_to_pixels(latents, output)
++                except BaseException:
++                    if encoder is not None:
++                        encoder.abort()
++                    raise
++                finally:
++                    self.vae.yuv_chunk_ready = None
+             if is_output_rank and output is not None and output.dtype == torch.float32:
+                 # Quantize to uint8 here, before the frames cross the
+                 # multiprocess-executor boundary. A 345-frame 1344x768 clip is
+@@ -204,6 +237,10 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
              elif self._output_buffer is not None and output is self._output_buffer[1]:
                  output = output.clone()
              batch.output = output if is_output_rank else placeholder
 +            if yuv is not None:
 +                batch.extra["yuv420p"] = yuv
++            if encoder is not None:
++                batch.extra["yuv_stream"] = encoder
              return batch
          finally:
              if fastvideo_args.vae_cpu_offload:
 diff --git a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py
-index d833399..9d613c9 100644
+index d833399..df8c4ff 100644
 --- a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py
 +++ b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py
-@@ -24,6 +24,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
+@@ -4,17 +4,24 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import dataclasses
+ from typing import Any
+ 
+ import torch
+ 
+ from fastvideo.attention.selector import component_attention_backend, get_attn_backend
++from fastvideo.configs.pipelines.minimax_h3_token_reduction import MiniMaxH3TokenReductionSchedule
+ from fastvideo.distributed import get_local_torch_device
+ from fastvideo.fastvideo_args import FastVideoArgs
+ from fastvideo.forward_context import set_forward_context
+ from fastvideo.hooks.activation_trace import trace_step
+ from fastvideo.layers.pdd import PDDModalitySchedule, PDDSamplingPlan, build_pdd_sampling_plan
+ from fastvideo.logger import init_logger
++from fastvideo.models.dits.minimax_h3_token_reduction import (
++    MiniMaxH3TokenReduction,
++    build_token_reduction,
++    reduced_token_width,
++)
+ from fastvideo.profiler import nvtx_range, profiler_region
+ from fastvideo.pipelines.basic.minimax_h3.packing import (
+     MINIMAX_H3_KEYFRAME_NOISE_AUG,
+@@ -24,6 +31,7 @@ from fastvideo.pipelines.basic.minimax_h3.packing import (
  from fastvideo.pipelines.basic.minimax_h3.stages.minimax_h3_latent_preparation import MINIMAX_H3_LAYOUT_KEY
  from fastvideo.pipelines.basic.minimax_h3.vsa_guard import refuse_zero_initialized_h3_vsa
  from fastvideo.pipelines.lazy_module import is_lazy_module
@@ -285,7 +691,110 @@ index d833399..9d613c9 100644
  from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
  from fastvideo.pipelines.stages.base import PipelineStage
  from fastvideo.pipelines.stages.validators import StageValidators as V
-@@ -349,6 +350,10 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+@@ -122,6 +130,35 @@ def _h3_vsa_ref2va_segments(
+     return tuple(segments)
+ 
+ 
++def _h3_token_reduction_plan(
++    layout: MiniMaxH3PackedLayout,
++    patch_size: tuple[int, int, int],
++    schedule: MiniMaxH3TokenReductionSchedule,
++) -> MiniMaxH3TokenReduction:
++    """Pair rows of the generated video, which every H3 packing places last in row-major ``(t, h, w)`` order."""
++    if layout.pad_tokens:
++        raise ValueError("MiniMax-H3 token reduction does not support capacity padding rows.")
++    grid = (layout.num_video_latent_frames // patch_size[0], layout.latent_height // patch_size[1],
++            layout.latent_width // patch_size[2])
++    num_target_rows = grid[0] * grid[1] * grid[2]
++    video_start = layout.sequence_length - num_target_rows
++    target_rows = layout.video_indices[layout.num_condition_video_rows:]
++    if target_rows.numel() != num_target_rows or not torch.equal(target_rows.cpu(),
++                                                                 torch.arange(video_start, layout.sequence_length)):
++        raise ValueError("MiniMax-H3 token reduction needs the generated video to end the packed sequence.")
++    return build_token_reduction(layout.position_ids, video_start, grid, schedule)
++
++
++def _h3_token_reduced_segments(
++    segments: tuple[int | tuple[int, int, int], ...],
++    patch_size: tuple[int, int, int],
++) -> tuple[int | tuple[int, int, int], ...]:
++    """VSA-H3 segments of the reduced sequence: the generated video (last region) at half token width."""
++    frames, height, width = segments[-1]  # type: ignore[misc]
++    reduced_width = reduced_token_width(width // patch_size[2]) * patch_size[2]
++    return (*segments[:-1], (frames, height, reduced_width))
++
++
+ class MiniMaxH3DenoisingStage(PipelineStage):
+     """Build both schedules and denoise both modalities in one transformer call."""
+ 
+@@ -309,6 +346,31 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+                 logger.info("MiniMax-H3 VSA-H3: %d reference video region(s); %s; %d-token tiles.",
+                             num_reference_regions, effect, vsa_tile_size)
+ 
++        token_reduction_schedule = MiniMaxH3TokenReductionSchedule.from_options(
++            getattr(fastvideo_args, "h3_token_reduction", {}))
++        token_reduction = None
++        reduced_vsa_metadata_builder = None
++        reduced_vsa_packed_segments: tuple[int | tuple[int, int, int], ...] = ()
++        if token_reduction_schedule is not None:
++            dit_patch_size = fastvideo_args.pipeline_config.dit_config.patch_size
++            token_reduction = _h3_token_reduction_plan(layout, dit_patch_size, token_reduction_schedule).to(device)
++            logger.info(
++                "MiniMax-H3 token reduction: %d -> %d rows in blocks %d:%d (%d:%d for the first %d step(s)), "
++                "update scale %g.", token_reduction.sequence_length, token_reduction.reduced_length,
++                token_reduction_schedule.begin, token_reduction_schedule.end, token_reduction_schedule.begin,
++                token_reduction_schedule.early_end, token_reduction_schedule.early_steps,
++                token_reduction_schedule.update_scale)
++            if (token_reduction_schedule.early_steps >= len(video_timesteps)
++                    and token_reduction_schedule.early_end != token_reduction_schedule.end):
++                logger.warning(
++                    "MiniMax-H3 token reduction: the early interval covers all %d forwards, so every forward "
++                    "reduces blocks %d:%d.", len(video_timesteps), token_reduction_schedule.begin,
++                    token_reduction_schedule.early_end)
++            if vsa_metadata_builder is not None:
++                # Its own builder, so each sequence length keeps its own tile buffers.
++                reduced_vsa_metadata_builder = _h3_vsa_metadata_builder(self.transformer, fastvideo_args)
++                reduced_vsa_packed_segments = _h3_token_reduced_segments(vsa_packed_segments, vsa_patch_size)
++
+         try:
+             if full_cpu_offload:
+                 self.transformer.to(device)
+@@ -327,6 +389,11 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+                         break
+                     unique_timesteps, timestep_indices = row_timestep_plan[index]
+                     attn_metadata = None
++                    step_token_reduction = None
++                    if token_reduction is not None:
++                        assert token_reduction_schedule is not None
++                        step_token_reduction = dataclasses.replace(token_reduction,
++                                                                   end=token_reduction_schedule.end_for_step(index))
+                     if vsa_metadata_builder is not None:
+                         # Optional schedule: run the first N steps dense (sparsity 0
+                         # selects every tile — parity-proven ≡ dense ≤2e-4); early
+@@ -343,12 +410,33 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+                             tile_size=vsa_tile_size,
+                             ref_keep_rate=vsa_ref_keep_rate,
+                         )
++                        if step_token_reduction is not None:
++                            assert reduced_vsa_metadata_builder is not None
++                            reduced_attn_metadata = reduced_vsa_metadata_builder.build(
++                                current_timestep=index,
++                                patch_size=vsa_patch_size,
++                                VSA_sparsity=vsa_sparsity,
++                                packed_segments=reduced_vsa_packed_segments,
++                                device=device,
++                                exempt=vsa_exempt,
++                                dense_layers=vsa_dense_layers,
++                                tile_size=vsa_tile_size,
++                                ref_keep_rate=vsa_ref_keep_rate,
++                            )
++                            step_token_reduction = dataclasses.replace(step_token_reduction,
++                                                                       attn_metadata=reduced_attn_metadata)
++                    # Only pass the argument when reducing, so transformers without it keep working.
++                    reduction_kwargs = {} if step_token_reduction is None else {"token_reduction": step_token_reduction}
+                     # Under torch.compile(mode="reduce-overhead") each denoising
+                     # step must be marked, or cudagraph trees flag cross-step
+                     # reuse of pooled outputs as "accessing tensor output of
                      # CUDAGraphs that has been overwritten" (surfaces at sp=1;
                      # sp>1 is masked by collective-induced graph breaks).
                      torch.compiler.cudagraph_mark_step_begin()
@@ -296,8 +805,11 @@ index d833399..9d613c9 100644
                      with self._pdd_head_fusion(
                              pdd_plan,
                              index), trace_step(index), nvtx_range(f"minimax_h3.step{index}"), set_forward_context(
-@@ -369,6 +374,8 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+@@ -367,8 +455,11 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+                             video_indices=video_indices,
+                             audio_indices=audio_indices,
                              text_indices=text_indices,
++                            **reduction_kwargs,
                          )
  
 +                    if QUALITY_HOOK.active:

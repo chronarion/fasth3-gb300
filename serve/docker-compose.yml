@@ -37,10 +37,14 @@ x-common: &common
     # Decoded frames -> yuv420p on the GPU, raw yuv into ffmpeg (ffmpeg's RGB conversion is slow on Grace); keeps the
     # pixel buffers pinned.
     FASTVIDEO_H3_YUV_OUT: ${FASTVIDEO_H3_YUV_OUT:-1}
+    # Encode the H.264 video while the VAE decodes the rest of the clip; saving then only muxes the audio
+    # (-0.07 s per 5 s clip, same encoder settings).
+    FASTVIDEO_H3_YUV_STREAM: ${FASTVIDEO_H3_YUV_STREAM:-1}
     # FlashAttention-4 for the VAE decoder's attention.
     FASTVIDEO_FA4: ${FASTVIDEO_FA4:-1}
-    # Qwen3-VL encoder attention: "" = FA2 (t2v: short prompts encode faster on FA2), cudnn (Omni default).
-    FASTVIDEO_H3_ENCODER_SDPA: ${FASTVIDEO_H3_ENCODER_SDPA-}
+    # Qwen3-VL encoder attention: cudnn = cuDNN fused attention (a 10K-token prompt encodes in 0.55 s instead of
+    # 0.68 s; short prompts take the same ~60 ms), "" = PyTorch's FlashAttention-2.
+    FASTVIDEO_H3_ENCODER_SDPA: ${FASTVIDEO_H3_ENCODER_SDPA-cudnn}
     # FastVideo's own speed switches.
     FASTVIDEO_VSA_PTX_BLACKWELL: ${FASTVIDEO_VSA_PTX_BLACKWELL:-1}            # tcgen05 VSA kernel
     FASTVIDEO_MINIMAX_H3_EXACT_KERNELS: ${FASTVIDEO_MINIMAX_H3_EXACT_KERNELS:-all}
@@ -65,6 +69,12 @@ x-common: &common
     # FP8 DiT linears (per-tensor weights; the fused path quantizes activations per row), compiled VAE, no DiT compile
     # (the fused path runs eager).
     FV_ARGS: ${FV_ARGS:---generator.engine.compile.vae_enabled true --generator.engine.quantization.transformer_quant FP8}
+    # Token reduction (FastVideo's training-free mode, after antirez's h3.c): the middle DiT blocks run on horizontally
+    # paired video tokens. Lossy (not the same video); off unless a profile sets it (profiles/token-reduction.env).
+    TR_ARGS: ${TR_ARGS:-}
+    # LoRAs: every *.safetensors in serve/loras is on the per-request allow-list (serve/with_loras.py); they run as
+    # side branches beside the quantized weights, so a request can switch adapter or strength.
+    FASTVIDEO_LORA_SIDE_BRANCH: ${FASTVIDEO_LORA_SIDE_BRANCH:-1}
     # Measurement only (README, "Quality"): H3Q_DUMP=/q/<name> records every denoising step's inputs and velocities,
     # H3Q_REPLAY=/q/<name> feeds a run the recorded inputs and logs the relative L2 of its velocities against them.
     H3Q_DUMP: ${H3Q_DUMP:-}
@@ -75,6 +85,7 @@ x-common: &common
     - ${FASTH3_CACHE:-./cache}:/cache
     - ${FASTH3_QDIR:-./quality}:/q
     - .:/config:ro
+    - ${FASTH3_LORAS:-./loras}:/loras:ro
 
 services:
   t2v:
@@ -89,7 +100,7 @@ services:
       # Prefix rows below which the prefix stays in the sparse kernel: 0 for the BF16 default (no cost on short prompts);
       # the 8-bit profiles set 2048 (their kernel is fast enough that short prefixes lose a little on the dense path).
       FASTVIDEO_H3_DENSE_PREFIX_MIN_ROWS: ${T2V_DENSE_PREFIX_MIN_ROWS:-0}
-    entrypoint: ["sh", "-c", "/opt/venv/bin/fastvideo serve --config /config/fasth3-8step.yaml $$FV_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3 ) & wait $$s"]
+    entrypoint: ["sh", "-c", "/opt/venv/bin/python3 -I /config/with_loras.py /config/fasth3-8step.yaml /loras /tmp/serve.yaml || exit 1; /opt/venv/bin/fastvideo serve --config /tmp/serve.yaml $$FV_ARGS $$TR_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3 ) & wait $$s"]
 
   omni:
     <<: *common
@@ -103,4 +114,4 @@ services:
       FASTVIDEO_H3_DENSE_PREFIX: ${OMNI_DENSE_PREFIX-bf16}
       # cuDNN fused attention for the encoder, which sees the reference image's vision tokens.
       FASTVIDEO_H3_ENCODER_SDPA: ${OMNI_ENCODER_SDPA-cudnn}
-    entrypoint: ["sh", "-c", "/opt/venv/bin/fastvideo serve --config /config/fasth3-omni.yaml $$FV_ARGS $$OMNI_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3-omni $$FV_WARMUP_REF ) & wait $$s"]
+    entrypoint: ["sh", "-c", "/opt/venv/bin/python3 -I /config/with_loras.py /config/fasth3-omni.yaml /loras /tmp/serve.yaml || exit 1; /opt/venv/bin/fastvideo serve --config /tmp/serve.yaml $$FV_ARGS $$OMNI_ARGS $$TR_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3-omni $$FV_WARMUP_REF ) & wait $$s"]
