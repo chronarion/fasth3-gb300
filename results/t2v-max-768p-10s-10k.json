@@ -1,0 +1,28 @@
+{
+  "label": "max-768p-10s-10k",
+  "service": "t2v",
+  "size": "server default",
+  "frames": 243,
+  "prompt": "long-10k.txt",
+  "lora": null,
+  "first_s": 30.91,
+  "done_s": 26.902,
+  "fetched_s": 26.923,
+  "pipeline_s": 26.722,
+  "runs_done": [
+    26.87,
+    26.94
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.1,
+    "conditioning_stage": 540.7,
+    "latent_preparation_stage": 47.2,
+    "denoising_stage": 24100.4,
+    "video_decoding_stage": 1959.7,
+    "audio_decoding_stage": 73.6
+  },
+  "samples": [
+    "video_gen_0468de8df05144d89f2348db1b2430c3.mp4",
+    "video_gen_32180fa8321c4ab2abf8255ec034023e.mp4"
+  ]
+}

@@ -4,26 +4,27 @@
   "size": "server default",
   "frames": 362,
   "prompt": "long-1k.txt",
-  "first_s": 56.75,
-  "done_s": 56.523,
-  "fetched_s": 56.554,
-  "pipeline_s": 56.178,
+  "lora": null,
+  "first_s": 54.68,
+  "done_s": 54.579,
+  "fetched_s": 54.613,
+  "pipeline_s": 54.227,
   "runs_done": [
-    56.52,
-    56.47,
-    56.68
+    54.51,
+    54.58,
+    54.64
   ],
   "stages_ms": {
     "input_preparation_stage": 0.0,
-    "conditioning_stage": 63.1,
-    "latent_preparation_stage": 67.9,
-    "denoising_stage": 52929.7,
-    "video_decoding_stage": 3020.2,
-    "audio_decoding_stage": 98.5
+    "conditioning_stage": 64.4,
+    "latent_preparation_stage": 68.0,
+    "denoising_stage": 50998.5,
+    "video_decoding_stage": 3000.1,
+    "audio_decoding_stage": 98.1
   },
   "samples": [
-    "video_gen_c4bb212e35684a15bc8c2ae1835fb705.mp4",
-    "video_gen_2e2346fd3d9943c993eff9f642b807d1.mp4",
-    "video_gen_13968c5e6bf447bdb6fc1443df268b3a.mp4"
+    "video_gen_cea47ef48aa643e7a09c1b876be322cf.mp4",
+    "video_gen_d8f97749b99748c781f211d8ec2abf59.mp4",
+    "video_gen_3a0a179571a24711ae2a1a65ab6c405d.mp4"
   ]
 }

@@ -4,24 +4,25 @@
   "size": "server default",
   "frames": 243,
   "prompt": "short",
-  "first_s": 29.4,
-  "done_s": 29.079,
-  "fetched_s": 29.092,
-  "pipeline_s": 28.805,
+  "lora": null,
+  "first_s": 28.44,
+  "done_s": 27.973,
+  "fetched_s": 27.985,
+  "pipeline_s": 27.789,
   "runs_done": [
-    29.05,
-    29.1
+    27.99,
+    27.96
   ],
   "stages_ms": {
-    "input_preparation_stage": 79.2,
-    "conditioning_stage": 584.8,
-    "latent_preparation_stage": 1345.2,
-    "denoising_stage": 24719.5,
-    "video_decoding_stage": 2002.1,
-    "audio_decoding_stage": 74.6
+    "input_preparation_stage": 81.0,
+    "conditioning_stage": 566.2,
+    "latent_preparation_stage": 653.2,
+    "denoising_stage": 24448.2,
+    "video_decoding_stage": 1970.8,
+    "audio_decoding_stage": 70.0
   },
   "samples": [
-    "video_gen_bec59a5a30424f42be55d928438679b9.mp4",
-    "video_gen_ceb7a369b4fa43c793847c1a3777a678.mp4"
+    "video_gen_c08e6d662b384feeb958fe7ec257d36b.mp4",
+    "video_gen_94c90fad83ac41f2af5cf5fa042f4d94.mp4"
   ]
 }

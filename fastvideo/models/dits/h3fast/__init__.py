@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+import fastvideo.envs as envs
 from fastvideo.attention.backends.video_sparse_attn import compute_topk
 from fastvideo.layers.quantization.nvfp4_config import _mm_fp4_backend, _require_flashinfer
 from fastvideo.logger import init_logger
@@ -36,7 +37,7 @@ def ext() -> Any:
         build.mkdir(parents=True, exist_ok=True)
         here = Path(__file__).parent
         _ext = load(name="h3fast",
-                    sources=[str(here / "h3fast.cu"), str(here / "h3attn8.cu")],
+                    sources=[str(here / f) for f in ("h3fast.cu", "h3attn8.cu", "h3attn16.cu", "h3attn16b.cu")],
                     build_directory=str(build),
                     extra_cuda_cflags=["-O3", "--use_fast_math", "-gencode=arch=compute_103a,code=sm_103a",
                                        "-std=c++17"],
@@ -46,6 +47,10 @@ def ext() -> Any:
 
 
 def _vsa_forward(tile: int) -> Any:
+    """BF16 sparse attention: h3fast's copy of FastVideo's kernel (vsa_bf16.cuh: row max from tcgen05.ld.red, every exp
+    on the hardware ex2) or, with FASTVIDEO_H3_BF16_VSA=stock, FastVideo's own op. Same arguments and results."""
+    if os.environ.get("FASTVIDEO_H3_BF16_VSA", "h3") != "stock":
+        return ext().vsa_bf16 if tile == 64 else ext().vsa_bf16_blk128
     from fastvideo_kernel._C import fastvideo_kernel_ops as ops
     return ops.block_sparse_ptx_blackwell_fwd if tile == 64 else ops.block_sparse_ptx_blackwell_blk128_fwd
 
@@ -66,6 +71,25 @@ def _adapter(layer: Any) -> tuple[torch.Tensor, torch.Tensor, float] | None:
     rank, alpha = layer.lora_rank, layer.lora_alpha
     scale = layer.lora_strength * (float(alpha) / float(rank) if alpha != rank else 1.0)
     return layer.slice_lora_a_weights(layer.lora_A), layer.slice_lora_b_weights(layer.lora_B), scale
+
+
+def _gate_quant(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The gate-compress weight in E4M3 with one float32 scale (the gate linear stays BF16 in the model)."""
+    scale = (weight.abs().amax().float() / _FP8_MAX).clamp(min=1e-12)
+    return (weight.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8), scale
+
+
+def _on_grid(merged: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``merged`` (fp32, a LoRA folded into a weight) in E4M3 on the base weight's grid ``scale`` (one per tensor or
+    per output row): the same rounding grid keeps the merged model's quantization error that of the base (a fresh
+    scale measured +1-3% teacher-forced error). A tensor or row that outgrows the grid's range by more than 5% gets
+    its own scale instead of clipping."""
+    rows = scale.numel() > 1
+    amax = merged.abs().amax(dim=1) if rows else merged.abs().amax().reshape(1)
+    scale = torch.where(amax <= 1.05 * _FP8_MAX * scale.reshape(-1), scale.reshape(-1),
+                        (amax / _FP8_MAX).clamp(min=1e-12)).float()
+    q = (merged / (scale[:, None] if rows else scale)).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8)
+    return q, scale if rows else scale.reshape(1)
 
 
 @dataclass
@@ -123,10 +147,16 @@ class H3FastRunner:
         # per block. Selection can move at near-ties (the stock path scores in fp32); the teacher-forced error vs BF16
         # did not go up (0.194 / 0.071 -> 0.191 / 0.068). "0" keeps fp32.
         self.tf32_scores = os.environ.get("FASTVIDEO_H3_TF32_SCORES", "1") != "0"
+        # The gate-compress GEMM and the compressed branch on a second stream: both only feed attn_gate_quant, so they
+        # can overlap the prologue / scores / top-k and the sparse attention.
+        self.side = torch.cuda.Stream() if os.environ.get("FASTVIDEO_H3_SIDE_STREAM", "1") == "1" else None
         self.layouts: dict[tuple, _Layout] = {}
         self.one: torch.Tensor | None = None
         self._gate_fp8: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._lora_dev: dict[int, tuple[Any, torch.Tensor, torch.Tensor]] = {}
+        # FASTVIDEO_H3_LORA_MERGE: FP8 weights with the active LoRA adapter merged in, per LoRA layer
+        self.lora_merge = envs.FASTVIDEO_H3_LORA_MERGE.get()
+        self._merged: dict[int, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
         # (input, A) -> x A^T of the last side branch; reset wherever the input buffers get new contents
         self._lora_t: tuple[tuple, torch.Tensor] | None = None
         ext()
@@ -147,10 +177,7 @@ class H3FastRunner:
             return attn.to_gate_compress
         entry = self._gate_fp8.get(index)
         if entry is None:
-            weight = _base(attn.to_gate_compress).weight.data
-            scale = (weight.abs().amax().float() / _FP8_MAX).clamp(min=1e-12)
-            entry = ((weight.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8), scale)
-            self._gate_fp8[index] = entry
+            entry = self._gate_fp8[index] = _gate_quant(_base(attn.to_gate_compress).weight.data)
         return entry
 
     def _get_layout(self, rows: int, device: torch.device, meta: Any, rotary: tuple[torch.Tensor, torch.Tensor],
@@ -324,12 +351,44 @@ class H3FastRunner:
             self._lora_t = (key, t)
         out.addmm_(t, cached[2], alpha=scale)
 
+    @torch.no_grad()
+    def _merged_fp8(self, wrapper: Any, adapter: tuple, source: torch.Tensor | None,
+                    quantize: Any) -> tuple[torch.Tensor, ...] | None:
+        """FP8 weight and scale of ``source`` (the dense weight under ``wrapper``) with ``wrapper``'s active LoRA
+        ``adapter`` merged in (in fp32) and quantized by ``quantize`` the way the base weight was, built on the first
+        forward after the adapter or its strength changes; None without a dense source (the adapter then runs as a
+        side branch)."""
+        if source is None or not self.lora_merge:
+            return None
+        A, B, scale = adapter
+        # Keyed by the adapter file and strength: FastVideo wraps the same factors in new Parameters on every strength
+        # change. An adapter without a path is keyed by those Parameters, which the entry holds (ids stay unique).
+        path = getattr(wrapper, "lora_path", None)
+        key = (path, scale) if path else (wrapper.lora_A, wrapper.lora_B, scale)
+        entry = self._merged.get(id(wrapper))
+        if entry is None or len(entry[0]) != len(key) or any(
+                old is not new and (torch.is_tensor(old) or old != new) for old, new in zip(entry[0], key)):
+            device = self.one.device
+            merged = source.to(device, non_blocking=True).float()
+            merged.addmm_(B.to(device, torch.float32), A.to(device, torch.float32), alpha=scale)
+            entry = self._merged[id(wrapper)] = (key, *quantize(merged))
+            del merged
+        return entry[1], entry[2]
+
     def _gemm(self, a: torch.Tensor, sf: torch.Tensor | None, layer: Any, out: torch.Tensor) -> None:
         wrapper, layer = layer, _base(layer)
         if sf is None:
-            torch._scaled_mm(a, layer._fp8_weight.t(), scale_a=self.one, scale_b=layer._fp8_weight_scale,
-                             out_dtype=torch.bfloat16, out=out)
-            self._lora_add(wrapper, a, out)
+            weight, scale = layer._fp8_weight, layer._fp8_weight_scale
+            adapter = _adapter(wrapper)
+            merged = None
+            if adapter is not None:
+                merged = self._merged_fp8(wrapper, adapter, getattr(layer, "_fp8_source", None),
+                                          lambda w: _on_grid(w, layer._fp8_weight_scale))
+                if merged is not None:
+                    weight, scale = merged
+            torch._scaled_mm(a, weight.t(), scale_a=self.one, scale_b=scale, out_dtype=torch.bfloat16, out=out)
+            if adapter is not None and merged is None:
+                self._lora_add(wrapper, a, out)
             return
         alpha = getattr(layer, "_h3fast_alpha", None)
         if alpha is None:
@@ -403,13 +462,26 @@ class H3FastRunner:
         self._gemm(h, h_sf, attn.to_k, kk)
         self._gemm(h, h_sf, attn.to_v, v)
         gate_entry = self._layer_gate(index, attn)
+        main = torch.cuda.current_stream()
+        side = self.side if gate_entry is not None else None
+        if side is not None:
+            side.wait_stream(main)
         if gate_entry is not None:
-            if self.fp4:
-                self._gemm(h, h_sf, gate_entry, g)
-            else:
-                torch._scaled_mm(h, gate_entry[0].t(), scale_a=self.one, scale_b=gate_entry[1],
-                                 out_dtype=torch.bfloat16, out=g)
-                self._lora_add(attn.to_gate_compress, h, g)
+            adapter = merged = None
+            if not self.fp4:  # the merged weight is built on the main stream (see _merged_fp8)
+                adapter = _adapter(attn.to_gate_compress)
+                merged = None if adapter is None else self._merged_fp8(
+                    attn.to_gate_compress, adapter, _base(attn.to_gate_compress).weight,
+                    lambda w: _on_grid(w, gate_entry[1]))
+            with torch.cuda.stream(side or main):
+                self._lora_t = None
+                if self.fp4:
+                    self._gemm(h, h_sf, gate_entry, g)
+                else:
+                    weight, scale = merged or gate_entry
+                    torch._scaled_mm(h, weight.t(), scale_a=self.one, scale_b=scale, out_dtype=torch.bfloat16, out=g)
+                    if adapter is not None and merged is None:
+                        self._lora_add(attn.to_gate_compress, h, g)
         self._lora_t = None  # the next side branches read other buffers (and h gets new contents before fc_in)
         split = L.n_pre > 0
         if self.fp8_attn:
@@ -431,7 +503,12 @@ class H3FastRunner:
                     cfg["dense_ks"] if dense else cfg["sparse_ks"], b["idx"], b["num"], split)
         oc, lse2 = None, b.get("lse2")
         if gate_entry is not None:
-            oc = torch.bmm(torch.softmax(b["sc"], dim=-1), b["vp"]).to(x.dtype)
+            if side is not None:
+                side.wait_stream(main)
+            with torch.cuda.stream(side or main):
+                oc = torch.bmm(torch.softmax(b["sc"], dim=-1), b["vp"]).to(x.dtype)
+            if side is not None:
+                oc.record_stream(main)
         torch.backends.cuda.matmul.allow_tf32 = prev_tf32
         if L.tile == 128 and self.pair128:
             # each 128-key block as two 64-key blocks selected by both halves of the 128-row tile
@@ -454,6 +531,8 @@ class H3FastRunner:
             out, lse2 = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, True)
         else:
             out = fwd(b["qb"], b["kb"], b["vb"], None, b["idx"], b["num"], L.vbs_ext, sm_scale, False)[0]
+        if side is not None:
+            main.wait_stream(side)
         k.attn_gate_quant(out, g if gate_entry is not None else None, hs if gate_entry is not None else None, oc, L.slot,
                           L.n_tiles, L.tile, a, a_sf, as_, L.rows, b.get("o1"), b.get("lse1a"), b.get("lse1b"),
                           lse2)

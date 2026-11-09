@@ -1,5 +1,45 @@
+diff --git a/fastvideo/entrypoints/openai/serving_engine.py b/fastvideo/entrypoints/openai/serving_engine.py
+index 5717151..7bfad66 100644
+--- a/fastvideo/entrypoints/openai/serving_engine.py
++++ b/fastvideo/entrypoints/openai/serving_engine.py
+@@ -7,6 +7,7 @@ import asyncio
+ from collections.abc import Awaitable, Callable
+ from typing import Any, Protocol, TypeVar
+ 
++import fastvideo.envs as envs
+ from fastvideo.api.schema import GenerationRequest
+ from fastvideo.entrypoints.openai.lora import LoraRuntime, LoraSelection
+ from fastvideo.entrypoints.openai.protocol import VideoGenerationRequest
+@@ -39,6 +40,11 @@ class OpenAIServingEngine:
+                  video_request_validator: Callable[[VideoGenerationRequest], None] | None = None,
+                  lora_runtime: LoraRuntime | None = None) -> None:
+         self._generator = generator
++        # FASTVIDEO_H3_DEFER_SAVE=1: a clip whose video was encoded during the decode finishes its save (encode end +
++        # audio mux) on the generator's save thread after this lock is released, so the next queued request starts
++        # right away; video jobs wait for the result's ``save_future`` before they complete.
++        if envs.FASTVIDEO_H3_DEFER_SAVE.get() and hasattr(generator, "_save_pool"):
++            generator.defer_video_save = True
+         self._lora_runtime = lora_runtime
+         self._video_request_validator = video_request_validator
+         self._generation_lock = asyncio.Lock()
+diff --git a/fastvideo/entrypoints/openai/video_api.py b/fastvideo/entrypoints/openai/video_api.py
+index 0ec8099..7d13e80 100644
+--- a/fastvideo/entrypoints/openai/video_api.py
++++ b/fastvideo/entrypoints/openai/video_api.py
+@@ -236,6 +236,11 @@ async def _run_generation(
+             if not result:
+                 raise RuntimeError("FastVideo returned no generation results")
+             result = result[0]
++        extra = result if isinstance(result, dict) else (_result_value(result, "extra") or {})
++        save_future = extra.get("save_future")
++        if save_future is not None:
++            # FASTVIDEO_H3_DEFER_SAVE: the pipeline is free already; the file is complete once the save finishes
++            await asyncio.wrap_future(save_future)
+         elapsed = time.perf_counter() - started
+         video_path = _result_value(result, "video_path") or generation_request.output.output_path
+         generation_time = _result_value(result, "generation_time", elapsed)
 diff --git a/fastvideo/entrypoints/video_generator.py b/fastvideo/entrypoints/video_generator.py
-index dc52f44..99529bd 100644
+index dc52f44..316db3e 100644
 --- a/fastvideo/entrypoints/video_generator.py
 +++ b/fastvideo/entrypoints/video_generator.py
 @@ -6,11 +6,11 @@ This module provides a consolidated interface for generating videos using
@@ -40,26 +80,138 @@ index dc52f44..99529bd 100644
          except BaseException:  # noqa: BLE001
              # Ctrl-C lands in the main thread while the in-process forward pass
              # keeps running in `execute_forward_thread`; flag the pipeline so the
-@@ -1110,13 +1115,18 @@ class VideoGenerator:
+@@ -1077,6 +1082,7 @@ class VideoGenerator:
+         save_to_disk = batch.save_video and not is_latent_output
+         save_video_time = 0.0
+         audio_mux_time = 0.0
++        save_future = None
+         if save_to_disk:
+             if audio_only:
+                 # Audio-only workload: write a standalone .wav rather than
+@@ -1105,18 +1111,35 @@ class VideoGenerator:
+                 save_fps = int(output_batch.extra.get("output_fps") or batch.fps)
+                 audio = output_batch.extra.get("audio")
+                 audio_sample_rate = output_batch.extra.get("audio_sample_rate")
+-                if audio is not None and audio_sample_rate is not None:
++                yuv_stream = output_batch.extra.pop("yuv_stream", None)
++                if (audio is not None and audio_sample_rate is not None and yuv_stream is not None
++                        and getattr(self, "defer_video_save", False)):
++                    # The video was encoded during the decode; finishing it and muxing the audio runs on the save
++                    # thread so the next request can start (the caller waits for ``save_future`` before using the
++                    # file).
++                    save_future = self._save_pool().submit(self._finish_streamed_save, output_path, frames, save_fps,
++                                                           audio, int(audio_sample_rate),
++                                                           output_batch.extra.get("yuv420p"), yuv_stream)
++                elif audio is not None and audio_sample_rate is not None:
+                     # Single-pass save path: encode video+audio once, avoiding
                      # second-pass remux overhead. AudioMuxStage remains 0.0 on
                      # success because audio is already present in the saved MP4.
                      save_start = time.perf_counter()
-+                    yuv_stream = output_batch.extra.pop("yuv_stream", None)
-                     save_ok = self._save_video_with_audio_ffmpeg_pipe(
-                         output_path=output_path,
-                         frames=frames,
-                         fps=save_fps,
-                         audio=audio,
-                         sample_rate=int(audio_sample_rate),
-+                        yuv420p=output_batch.extra.get("yuv420p"),
-+                        yuv_stream=yuv_stream,
-                     )
-+                    if yuv_stream is not None and not yuv_stream.done:
-+                        yuv_stream.abort()
+-                    save_ok = self._save_video_with_audio_ffmpeg_pipe(
+-                        output_path=output_path,
+-                        frames=frames,
+-                        fps=save_fps,
+-                        audio=audio,
+-                        sample_rate=int(audio_sample_rate),
+-                    )
++                    try:
++                        save_ok = self._save_video_with_audio_ffmpeg_pipe(
++                            output_path=output_path,
++                            frames=frames,
++                            fps=save_fps,
++                            audio=audio,
++                            sample_rate=int(audio_sample_rate),
++                            yuv420p=output_batch.extra.get("yuv420p"),
++                            yuv_stream=yuv_stream,
++                        )
++                    finally:
++                        if yuv_stream is not None:
++                            if not yuv_stream.done:
++                                yuv_stream.abort()
++                            yuv_stream.release()
                      if not save_ok:
                          logger.warning("ffmpeg pipe save failed; trying PyAV single-pass save.")
                          save_ok = self._save_video_with_audio_single_pass(
-@@ -1347,8 +1357,13 @@ class VideoGenerator:
+@@ -1140,18 +1163,22 @@ class VideoGenerator:
+                         if not mux_ok:
+                             logger.warning("Audio mux failed; saved video without audio.")
+                 else:
++                    if yuv_stream is not None:  # no audio: the RGB frames are saved below
++                        yuv_stream.abort()
+                     save_start = time.perf_counter()
+                     imageio.mimsave(output_path, frames, fps=save_fps, format="mp4")
+                     save_video_time = time.perf_counter() - save_start
+                     audio_mux_time = 0.0
+-                logger.info("Saved video to %s", output_path)
++                if save_future is None:
++                    logger.info("Saved video to %s", output_path)
+ 
+-            logger.info("VideoSaveStage completed in %.3f s", save_video_time)
+-            if logging_info is not None:
+-                logging_info.add_stage_execution_time("VideoSaveStage", save_video_time)
+-            logger.info("AudioMuxStage completed in %.3f s", audio_mux_time)
+-            if logging_info is not None:
+-                logging_info.add_stage_execution_time("AudioMuxStage", audio_mux_time)
++            if save_future is None:
++                logger.info("VideoSaveStage completed in %.3f s", save_video_time)
++                if logging_info is not None:
++                    logging_info.add_stage_execution_time("VideoSaveStage", save_video_time)
++                logger.info("AudioMuxStage completed in %.3f s", audio_mux_time)
++                if logging_info is not None:
++                    logging_info.add_stage_execution_time("AudioMuxStage", audio_mux_time)
+ 
+         e2e_time = time.perf_counter() - start_time
+         logger.info("End-to-end latency: %.2f seconds", e2e_time)
+@@ -1177,6 +1204,8 @@ class VideoGenerator:
+             "video_path": output_path if save_to_disk else None,
+             "peak_memory_mb": output_batch.extra.get("peak_memory_mb"),
+         }
++        if save_future is not None:
++            result["save_future"] = save_future
+ 
+         return result
+ 
+@@ -1339,6 +1368,39 @@ class VideoGenerator:
+             _FFMPEG_ENCODER_OPTION_CACHE[cache_key] = False
+             return False
+ 
++    def _save_pool(self) -> concurrent.futures.ThreadPoolExecutor:
++        pool = self.__dict__.get("_save_pool_executor")
++        if pool is None:
++            pool = self.__dict__["_save_pool_executor"] = concurrent.futures.ThreadPoolExecutor(1, "fastvideo-save")
++        return pool
++
++    @classmethod
++    def _finish_streamed_save(cls, output_path: str, frames: list[np.ndarray], fps: int, audio: Any, sample_rate: int,
++                              yuv420p: torch.Tensor | None, yuv_stream: Any) -> None:
++        """Deferred save of a clip whose video was encoded during the decode (``defer_video_save``): finish the stream
++        and mux the audio, with the same fallbacks as the inline save; releases the stream's pinned buffer."""
++        save_start = time.perf_counter()
++        try:
++            save_ok = cls._save_video_with_audio_ffmpeg_pipe(output_path=output_path, frames=frames, fps=fps,
++                                                             audio=audio, sample_rate=sample_rate, yuv420p=yuv420p,
++                                                             yuv_stream=yuv_stream)
++        finally:
++            if not yuv_stream.done:
++                yuv_stream.abort()
++            yuv_stream.release()
++        if not save_ok:
++            logger.warning("ffmpeg pipe save failed; trying PyAV single-pass save.")
++            save_ok = cls._save_video_with_audio_single_pass(output_path=output_path, frames=frames, fps=fps,
++                                                             audio=audio, sample_rate=sample_rate)
++        if not save_ok:
++            logger.warning("Single-pass save failed; falling back to two-step save/mux.")
++            imageio.mimsave(output_path, frames, fps=fps, format="mp4")
++            if not cls._mux_audio(output_path, audio, sample_rate):
++                logger.warning("Audio mux failed; saved video without audio.")
++        logger.info("Saved video to %s", output_path)
++        logger.info("VideoSaveStage completed in %.3f s (after the request released the pipeline)",
++                    time.perf_counter() - save_start)
++
+     @classmethod
+     def _save_video_with_audio_ffmpeg_pipe(
+         cls,
+@@ -1347,8 +1409,13 @@ class VideoGenerator:
          fps: int,
          audio: torch.Tensor | np.ndarray,
          sample_rate: int,
@@ -74,7 +226,7 @@ index dc52f44..99529bd 100644
          ffmpeg_bin = shutil.which(envs.FASTVIDEO_FFMPEG_BIN.get())
          if ffmpeg_bin is None:
              logger.warning("ffmpeg not found; cannot use ffmpeg pipe save.")
-@@ -1370,6 +1385,19 @@ class VideoGenerator:
+@@ -1370,6 +1437,19 @@ class VideoGenerator:
                      logger.warning("Unexpected audio tensor for ffmpeg pipe save: %s", e)
                      return False
  
@@ -94,7 +246,7 @@ index dc52f44..99529bd 100644
                  cmd = [
                      ffmpeg_bin,
                      "-hide_banner",
-@@ -1379,7 +1407,7 @@ class VideoGenerator:
+@@ -1379,7 +1459,7 @@ class VideoGenerator:
                      "-f",
                      "rawvideo",
                      "-pix_fmt",
@@ -103,7 +255,7 @@ index dc52f44..99529bd 100644
                      "-s:v",
                      f"{width}x{height}",
                      "-r",
-@@ -1436,8 +1464,11 @@ class VideoGenerator:
+@@ -1436,8 +1516,11 @@ class VideoGenerator:
  
                  try:
                      ts_start = time.perf_counter()
@@ -118,7 +270,7 @@ index dc52f44..99529bd 100644
                      logger.info("Wrote frames to ffmpeg stdin in %.3f s", time.perf_counter() - ts_start)
                      rc = proc.wait()
 diff --git a/fastvideo/envs.py b/fastvideo/envs.py
-index 9eea7df..36bb5cf 100644
+index 9eea7df..150201a 100644
 --- a/fastvideo/envs.py
 +++ b/fastvideo/envs.py
 @@ -682,6 +682,18 @@ FASTVIDEO_H3_VSA_HEADS_FIRST_TILE = EnvBool(False,
@@ -140,6 +292,25 @@ index 9eea7df..36bb5cf 100644
  FASTVIDEO_H3_VSA_TILE_FIRST = EnvBool(False,
                                        category="attention",
                                        doc="Single-rank MiniMax-H3 VSA with one tile gather of the block input "
+@@ -713,6 +725,18 @@ FASTVIDEO_LORA_SIDE_BRANCH = EnvBool(False,
+                                      "target linear instead of merging them, so the adapter strength can change "
+                                      "at runtime. Packed NVFP4 or FP8 linears without their original dense "
+                                      "weight always use the side branch.")
++FASTVIDEO_H3_DEFER_SAVE = EnvBool(False,
++                                  category="performance",
++                                  doc="OpenAI server: when a MiniMax-H3 clip's video was encoded during the decode "
++                                  "(FASTVIDEO_H3_YUV_STREAM), finish the encode and mux the audio on a save thread "
++                                  "after the pipeline is released, so the next queued request starts at once; the "
++                                  "job completes when the file is written.")
++FASTVIDEO_H3_LORA_MERGE = EnvBool(False,
++                                  category="performance",
++                                  doc="Keep the dense weights of FP8 linears in page-locked host memory, so the fused "
++                                  "MiniMax-H3 path merges an inference LoRA adapter into them and quantizes again "
++                                  "once per adapter or strength change instead of running the adapter beside "
++                                  "every FP8 GEMM.")
+ FASTVIDEO_NVFP4_MM_BACKEND = EnvStr("auto",
+                                     category="performance",
+                                     doc="FlashInfer mm_fp4 backend for NVFP4 linears: auto (cudnn for MiniMax-H3 DiT "
 diff --git a/fastvideo/fastvideo_args.py b/fastvideo/fastvideo_args.py
 index 7024fe7..5464513 100644
 --- a/fastvideo/fastvideo_args.py
@@ -173,6 +344,108 @@ index 7024fe7..5464513 100644
          self._fold_vae_parallel_env()
          self._fold_h3_encoder_split_env()
          # Runs after FASTVIDEO_ATTENTION_BACKEND is copied into attention_backend,
+diff --git a/fastvideo/layers/quantization/fp8_config.py b/fastvideo/layers/quantization/fp8_config.py
+index 5198b92..b6a0768 100644
+--- a/fastvideo/layers/quantization/fp8_config.py
++++ b/fastvideo/layers/quantization/fp8_config.py
+@@ -254,35 +254,72 @@ class FP8Config(QuantizationConfig):
+         return None
+ 
+ 
++def quantize_fp8_weight(weight: torch.Tensor, granularity: str = "tensor") -> tuple[torch.Tensor, torch.Tensor]:
++    """``(fp8 weight, float32 scale)`` of a dense ``[out, in]`` weight: one scale per output channel or per tensor."""
++    if granularity == "channel":
++        w_absmax = weight.detach().abs().amax(dim=1).nan_to_num().float()
++        w_scale = (w_absmax / FP8_MAX).clamp(min=FP8_MIN_SCALE)
++        w_fp8 = (weight / w_scale.to(weight.dtype).unsqueeze(1)).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
++    else:
++        w_absmax = weight.detach().abs().amax().nan_to_num().to(torch.float32)
++        w_scale = (w_absmax / FP8_MAX).clamp(min=FP8_MIN_SCALE).view(1)
++        w_fp8 = (weight / w_scale.to(weight.dtype)).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
++    return w_fp8.contiguous(), w_scale.to(torch.float32)
++
++
++def _page_locked(numel_by_dtype: dict[torch.dtype, int]) -> dict[torch.dtype, torch.Tensor]:
++    """One page-locked host buffer per dtype, registered with CUDA (the pinned caching allocator would round every
++    allocation up to a power of two)."""
++    slabs = {}
++    for dtype, numel in numel_by_dtype.items():
++        slab = torch.empty(numel, dtype=dtype)
++        err = torch.cuda.cudart().cudaHostRegister(slab.data_ptr(), slab.numel() * slab.element_size(), 0)
++        if int(err) != 0:
++            logger.warning("cudaHostRegister failed (%s); the dense FP8 sources stay pageable", err)
++        slabs[dtype] = slab
++    return slabs
++
++
+ def convert_model_to_fp8(model: torch.nn.Module) -> None:
+     """Quantize all FP8-tagged linear layers in-place after weights are loaded."""
+     import gc
+     from torch.distributed.tensor import DTensor  # type: ignore
+ 
++    from fastvideo import envs
++
++    modules = [
++        mod for mod in model.modules()
++        if isinstance(getattr(mod, "quant_method", None), FP8QuantizeMethod)
++        and getattr(mod, "weight", None) is not None
++    ]
++    # FASTVIDEO_H3_LORA_MERGE: keep every dense weight on the host (``module._fp8_source``) so an inference LoRA
++    # adapter can later be merged into the original weight and quantized again, instead of running beside it.
++    sources: dict[torch.dtype, list[Any]] | None = None
++    if envs.FASTVIDEO_H3_LORA_MERGE.get():
++        sizes: dict[torch.dtype, int] = {}
++        for mod in modules:
++            if not isinstance(mod.weight, DTensor):
++                sizes[mod.weight.dtype] = sizes.get(mod.weight.dtype, 0) + mod.weight.numel()
++        sources = {dtype: [slab, 0] for dtype, slab in _page_locked(sizes).items()}
+     with torch.no_grad():
+-        for mod in model.modules():
+-            qm = getattr(mod, "quant_method", None)
+-            if not isinstance(qm, FP8QuantizeMethod):
+-                continue
+-            weight = getattr(mod, "weight", None)
+-            if weight is None:
+-                continue
++        for mod in modules:
++            qm = mod.quant_method
++            weight = mod.weight
+             weight_local = weight.to_local() if isinstance(weight, DTensor) else weight  # type: ignore[arg-type]
+-            if getattr(qm, "granularity", "tensor") == "channel":
+-                w_absmax = weight_local.detach().abs().amax(dim=1).nan_to_num().float()
+-                w_scale = (w_absmax / FP8_MAX).clamp(min=FP8_MIN_SCALE)
+-                w_fp8 = (weight_local / w_scale.to(weight_local.dtype).unsqueeze(1)).clamp(-FP8_MAX,
+-                                                                                           FP8_MAX).to(FP8_DTYPE)
+-            else:
+-                w_absmax = weight_local.detach().abs().amax().nan_to_num().to(torch.float32)
+-                w_scale = (w_absmax / FP8_MAX).clamp(min=FP8_MIN_SCALE).view(1)
+-                w_fp8 = (weight_local / w_scale.to(weight_local.dtype)).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+-            mod.register_buffer("_fp8_weight", w_fp8.contiguous(), persistent=False)
+-            mod.register_buffer("_fp8_weight_scale", w_scale.to(torch.float32), persistent=False)
++            if sources is not None and not isinstance(weight, DTensor):
++                slab = sources[weight.dtype]
++                mod._fp8_source = slab[0][slab[1]:slab[1] + weight.numel()].view(weight.shape).copy_(weight_local)
++                slab[1] += weight.numel()
++            w_fp8, w_scale = quantize_fp8_weight(weight_local, getattr(qm, "granularity", "tensor"))
++            mod.register_buffer("_fp8_weight", w_fp8, persistent=False)
++            mod.register_buffer("_fp8_weight_scale", w_scale, persistent=False)
+             removed_weight = mod._parameters.pop("weight", None)
+             if removed_weight is not None:
+                 removed_weight.grad = None
+-            del removed_weight, weight, weight_local, w_absmax, w_scale, w_fp8
++            del removed_weight, weight, weight_local, w_scale, w_fp8
++    if sources:
++        logger.info("Kept %.1f GB of dense FP8-linear weights in page-locked host memory for LoRA merging",
++                    sum(slab.numel() * slab.element_size() for slab, _ in sources.values()) / 1e9)
+ 
+     gc.collect()
+     torch.cuda.empty_cache()
+@@ -292,4 +329,5 @@ __all__ = [
+     "FP8Config",
+     "FP8QuantizeMethod",
+     "convert_model_to_fp8",
++    "quantize_fp8_weight",
+ ]
 diff --git a/fastvideo/models/dits/minimax_h3.py b/fastvideo/models/dits/minimax_h3.py
 index 06ad52e..388c22f 100644
 --- a/fastvideo/models/dits/minimax_h3.py
@@ -463,6 +736,47 @@ index 9c9ffb9..06c6bc6 100644
  
          # Generator-only QAT for DMD distillation: the teacher (real_score) and
          # critic (fake_score) transformers load with this flag set and must stay
+diff --git a/fastvideo/models/vaes/minimax_h3_nvfp4_fused.py b/fastvideo/models/vaes/minimax_h3_nvfp4_fused.py
+index d88be6e..6c34dbd 100644
+--- a/fastvideo/models/vaes/minimax_h3_nvfp4_fused.py
++++ b/fastvideo/models/vaes/minimax_h3_nvfp4_fused.py
+@@ -35,6 +35,9 @@ from fastvideo.models.vaes.minimax_h3_nvfp4_decoder import NVFP4DecoderLinear, N
+ NVFP4_BLOCK = 16
+ SF_ROW_TILE = 128
+ # ATen's vectorized layer/RMS norm: 4 warps x 32 lanes, 4 elements per vector load.
++# Rows per program of the launchers below were tuned on GB300 at the 1344x768 decode shape (50,316 tokens x 2048):
++# qkv_epilogue 1 (1.54x vs 2), swiglu_quantize 4 (1.28x vs 2), residual_norm_quantize 1 (1.03x vs 4); every output is
++# bit-identical to the old launches (per-element arithmetic does not depend on them).
+ _NORM_THREADS = 128
+ _NORM_VEC = 4
+ 
+@@ -299,7 +302,7 @@ def new_quantized(m: int, k: int, device: torch.device) -> tuple[torch.Tensor, t
+ 
+ def residual_norm_quantize(h: torch.Tensor, residual: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+                            norm: tuple[torch.Tensor, float, torch.Tensor] | None,
+-                           rows_per_program: int = 4) -> tuple[torch.Tensor, torch.Tensor] | None:
++                           rows_per_program: int = 1) -> tuple[torch.Tensor, torch.Tensor] | None:
+     """In place ``h += bf16(o + bias) * scale`` and/or NVFP4 of ``bf16(rms_norm(h, gamma, eps))``.
+ 
+     ``h`` is a contiguous fp32 [M, D] tensor; ``residual`` is ``(o, bias_bf16, scale_fp32)``;
+@@ -349,7 +352,7 @@ def _silu_table(device_index: int) -> torch.Tensor:
+     return F.silu(patterns.to(torch.int16).view(torch.bfloat16))  # int32 -> int16 wraps to the bit pattern
+ 
+ 
+-def swiglu_quantize(o: torch.Tensor, bias: torch.Tensor, gsf: torch.Tensor, rows_per_program: int = 2,
++def swiglu_quantize(o: torch.Tensor, bias: torch.Tensor, gsf: torch.Tensor, rows_per_program: int = 4,
+                     block_n: int = 512) -> tuple[torch.Tensor, torch.Tensor]:
+     """NVFP4 of the H3 SwiGLU of a value-first packed projection ``o`` [M, 2F] (bias not yet added)."""
+     m, two_f = o.shape
+@@ -374,7 +377,7 @@ def swiglu_quantize(o: torch.Tensor, bias: torch.Tensor, gsf: torch.Tensor, rows
+ def qkv_epilogue(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, biases: tuple[torch.Tensor, torch.Tensor,
+                                                                                torch.Tensor], cos: torch.Tensor,
+                  sin: torch.Tensor, heads: int, eps: float,
+-                 rows_per_program: int = 2) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++                 rows_per_program: int = 1) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Projected q/k/v [M, H*HD] bf16 (bias not yet added) -> roped q, k and biased v, each [M, H, HD].
+ 
+     ``cos``/``sin`` are bf16 [M, ROT] (the eager path's ``cos.to(query.dtype)``).
 diff --git a/fastvideo/models/vaes/minimax_h3_video.py b/fastvideo/models/vaes/minimax_h3_video.py
 index 8f72df9..e3b4766 100644
 --- a/fastvideo/models/vaes/minimax_h3_video.py
@@ -503,19 +817,23 @@ index 8f72df9..e3b4766 100644
          if output_frame_start != output.shape[2]:
              raise RuntimeError(
 diff --git a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py
-index 667e9f8..752c203 100644
+index 667e9f8..b5ac16b 100644
 --- a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py
 +++ b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_conditioning.py
-@@ -32,6 +32,18 @@ from fastvideo.pipelines.stages.validators import VerificationResult
+@@ -32,6 +32,22 @@ from fastvideo.pipelines.stages.validators import VerificationResult
  MINIMAX_H3_TEXT_TOKEN_TAGS_KEY = "minimax_h3_text_token_tags"
  
  
-+def _encoder_sdpa_backends() -> Any:
++def _encoder_sdpa_backends(num_tokens: int) -> Any:
 +    """FASTVIDEO_H3_ENCODER_SDPA=cudnn: prefer cuDNN's fused attention for the Qwen3-VL encoder's SDPA calls (FA2 by
-+    default), keeping FlashAttention and the math kernel as fallbacks for shapes cuDNN rejects."""
++    default), keeping FlashAttention and the math kernel as fallbacks for shapes cuDNN rejects; only for presentations
++    of at least FASTVIDEO_H3_ENCODER_SDPA_MIN_TOKENS tokens (default 4096). cuDNN builds a graph for every sequence
++    length it has not seen (27-38 ms, once 0.7 s) and is ahead of FlashAttention by 0.06-3.2 ms per call from 1K to 10K
++    tokens, so over 50 layers a new length pays off from about 4.5K tokens on."""
 +    import contextlib
 +    import os
-+    if os.environ.get("FASTVIDEO_H3_ENCODER_SDPA", "") != "cudnn":
++    if (os.environ.get("FASTVIDEO_H3_ENCODER_SDPA", "") != "cudnn"
++            or num_tokens < int(os.environ.get("FASTVIDEO_H3_ENCODER_SDPA_MIN_TOKENS", "4096"))):
 +        return contextlib.nullcontext()
 +    from torch.nn.attention import SDPBackend, sdpa_kernel
 +    return sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
@@ -525,7 +843,37 @@ index 667e9f8..752c203 100644
  def _token_ids(tokenized: Any) -> list[int]:
      input_ids = tokenized["input_ids"] if isinstance(tokenized, dict) else tokenized.input_ids
      if isinstance(input_ids, torch.Tensor):
-@@ -166,7 +178,15 @@ class MiniMaxH3ConditioningStage(PipelineStage):
+@@ -142,17 +158,18 @@ class MiniMaxH3ConditioningStage(PipelineStage):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         input_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+         dtype = self.conditioner.dtype
+-        prompt_embeds = self.conditioner(
+-            input_ids,
+-            **{
+-                name:
+-                None if value is None else value.to(
+-                    device=device,
+-                    dtype=dtype if name in {"pixel_values", "pixel_values_videos"} else None,
+-                )
+-                for name, value in vision_inputs.items()
+-            },
+-        )
++        with _encoder_sdpa_backends(len(token_ids)):
++            prompt_embeds = self.conditioner(
++                input_ids,
++                **{
++                    name:
++                    None if value is None else value.to(
++                        device=device,
++                        dtype=dtype if name in {"pixel_values", "pixel_values_videos"} else None,
++                    )
++                    for name, value in vision_inputs.items()
++                },
++            )
+         if prompt_embeds.ndim != 2 or prompt_embeds.shape[0] != len(token_ids):
+             raise ValueError(f"MiniMax-H3 slim text encoder returned unexpected shape={tuple(prompt_embeds.shape)}")
+         return (
+@@ -166,7 +183,15 @@ class MiniMaxH3ConditioningStage(PipelineStage):
          images = batch.extra.get(MINIMAX_H3_KEYFRAMES_KEY, [])
          if not isinstance(images, list):
              raise TypeError("MiniMax-H3 keyframes must be a list.")
@@ -541,17 +889,8 @@ index 667e9f8..752c203 100644
          token_ids: list[int] = []
          token_tags: list[int] = []
          pixel_values = None
-@@ -286,7 +306,7 @@ class MiniMaxH3ConditioningStage(PipelineStage):
-         try:
-             # Keep both H3 prompt-presentation modes under one text-encoding
-             # range so Nsight Systems exposes their complete conditioning cost.
--            with nvtx_range("minimax_h3.text_encoding"):
-+            with nvtx_range("minimax_h3.text_encoding"), _encoder_sdpa_backends():
-                 if self.ref2va:
-                     prompt_embeds, text_token_tags = self._encode_ref2va(batch, device)
-                 else:
 diff --git a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py
-index ae764b6..c5c4ad4 100644
+index ae764b6..32acca8 100644
 --- a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py
 +++ b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_decoding.py
 @@ -14,6 +14,7 @@ from fastvideo.logger import init_logger
@@ -585,7 +924,7 @@ index ae764b6..c5c4ad4 100644
      def verify_input(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> VerificationResult:
          result = VerificationResult()
          result.add_check("layout", batch.extra.get(MINIMAX_H3_LAYOUT_KEY), V.not_none)
-@@ -174,11 +184,27 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -174,11 +184,29 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
                  return batch
  
              output = None
@@ -608,6 +947,8 @@ index ae764b6..c5c4ad4 100644
 +                yuv = self._pinned_buffer("yuv", (frames, height * width * 3 // 2), torch.uint8)
 +            self.vae.yuv_output = yuv
 +            encoder = None
++            if yuv is not None:
++                YuvStreamEncoder.wait_previous()  # a deferred save of the previous clip may still read the buffers
 +            if yuv is not None and YuvStreamEncoder.supported():
 +                fps = batch.extra.get("output_fps") or (batch.fps[0] if isinstance(batch.fps, list) else batch.fps)
 +                encoder = YuvStreamEncoder(yuv, shape[-1], shape[-2], int(fps or 24))
@@ -615,7 +956,7 @@ index ae764b6..c5c4ad4 100644
              # Attribute the streamed decoder computation while retaining
              # per-chunk device-to-host transfer and pinned-buffer reuse.
              # fp16 for the release decoders; NVFP4 decoders were trained under bf16.
-@@ -187,13 +213,20 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -187,13 +215,20 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
                      nvtx_range("minimax_h3.vae"),
                      torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=device.type == "cuda"),
              ):
@@ -643,7 +984,7 @@ index ae764b6..c5c4ad4 100644
              if is_output_rank and output is not None and output.dtype == torch.float32:
                  # Quantize to uint8 here, before the frames cross the
                  # multiprocess-executor boundary. A 345-frame 1344x768 clip is
-@@ -204,6 +237,10 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
+@@ -204,6 +239,10 @@ class MiniMaxH3VideoDecodingStage(PipelineStage):
              elif self._output_buffer is not None and output is self._output_buffer[1]:
                  output = output.clone()
              batch.output = output if is_output_rank else placeholder
@@ -655,7 +996,7 @@ index ae764b6..c5c4ad4 100644
          finally:
              if fastvideo_args.vae_cpu_offload:
 diff --git a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py
-index d833399..df8c4ff 100644
+index d833399..58b8629 100644
 --- a/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py
 +++ b/fastvideo/pipelines/basic/minimax_h3/stages/minimax_h3_denoising.py
 @@ -4,17 +4,24 @@
@@ -691,7 +1032,22 @@ index d833399..df8c4ff 100644
  from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
  from fastvideo.pipelines.stages.base import PipelineStage
  from fastvideo.pipelines.stages.validators import StageValidators as V
-@@ -122,6 +130,35 @@ def _h3_vsa_ref2va_segments(
+@@ -33,6 +41,14 @@ from fastvideo.utils import get_compute_dtype
+ logger = init_logger(__name__)
+ 
+ 
++def _to_device_pinned(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
++    """A host tensor on ``device`` through page-locked memory, without waiting for the GPU (a copy from pageable
++    memory synchronizes the stream)."""
++    if tensor.device.type != "cpu" or torch.device(device).type != "cuda":
++        return tensor.to(device)
++    return tensor.pin_memory().to(device, non_blocking=True)
++
++
+ def scale_pdd_initial_noise(video_rows: torch.Tensor, audio_rows: torch.Tensor, layout: MiniMaxH3PackedLayout,
+                             plan: PDDSamplingPlan) -> None:
+     """Start PDD targets at the first node's noise level (``0.999 * eps``), as the students are trained.
+@@ -122,6 +138,35 @@ def _h3_vsa_ref2va_segments(
      return tuple(segments)
  
  
@@ -727,7 +1083,52 @@ index d833399..df8c4ff 100644
  class MiniMaxH3DenoisingStage(PipelineStage):
      """Build both schedules and denoise both modalities in one transformer call."""
  
-@@ -309,6 +346,31 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+@@ -254,25 +299,32 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+         if len(video_timesteps) != len(audio_timesteps):
+             raise ValueError("MiniMax-H3 video and audio schedules must have the same number of intervals.")
+ 
+-        row_timestep_plan = []
+-        for video_timestep, audio_timestep in zip(video_timesteps, audio_timesteps, strict=True):
+-            video_value = float(video_timestep.item())
+-            audio_value = float(audio_timestep.item())
+-            unique, inverse = build_row_timesteps(
++        # Every step's per-row timestep table is built on the host and goes over in one copy per dtype: per-step
++        # .item() reads and small copies would each wait for the GPU while it has nothing queued.
++        tables = [
++            build_row_timesteps(
+                 layout,
+                 video_timestep=video_value,
+                 audio_timestep=audio_value,
+                 condition_video_timestep=max(video_value, MINIMAX_H3_KEYFRAME_NOISE_AUG),
+                 condition_audio_timestep=1.0,
+-            )
+-            row_timestep_plan.append((unique.to(device), inverse.to(device)))
++            ) for video_value, audio_value in zip(video_timesteps.detach().cpu().tolist(),
++                                                  audio_timesteps.detach().cpu().tolist(),
++                                                  strict=True)
++        ]
++        uniques = _to_device_pinned(torch.cat([unique for unique, _ in tables]), device)
++        inverses = _to_device_pinned(torch.cat([inverse for _, inverse in tables]), device)
++        row_timestep_plan = list(
++            zip(uniques.split([unique.numel() for unique, _ in tables]),
++                inverses.split([inverse.numel() for _, inverse in tables]),
++                strict=True))
+         batch.timesteps = video_timesteps
+ 
+-        position_ids = layout.position_ids.to(device)
+-        token_tags = layout.token_tags.to(device)
+-        video_indices = layout.video_indices.to(device)
+-        audio_indices = layout.audio_indices.to(device)
+-        text_indices = layout.text_indices.to(device)
++        position_ids = _to_device_pinned(layout.position_ids, device)
++        token_tags = _to_device_pinned(layout.token_tags, device)
++        video_indices = _to_device_pinned(layout.video_indices, device)
++        audio_indices = _to_device_pinned(layout.audio_indices, device)
++        text_indices = _to_device_pinned(layout.text_indices, device)
+         prompt_embeds = batch.prompt_embeds[0].to(device)
+ 
+         vsa_metadata_builder = _h3_vsa_metadata_builder(self.transformer, fastvideo_args)
+@@ -309,6 +361,31 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                  logger.info("MiniMax-H3 VSA-H3: %d reference video region(s); %s; %d-token tiles.",
                              num_reference_regions, effect, vsa_tile_size)
  
@@ -759,7 +1160,7 @@ index d833399..df8c4ff 100644
          try:
              if full_cpu_offload:
                  self.transformer.to(device)
-@@ -327,6 +389,11 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+@@ -327,6 +404,11 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                          break
                      unique_timesteps, timestep_indices = row_timestep_plan[index]
                      attn_metadata = None
@@ -771,7 +1172,7 @@ index d833399..df8c4ff 100644
                      if vsa_metadata_builder is not None:
                          # Optional schedule: run the first N steps dense (sparsity 0
                          # selects every tile — parity-proven ≡ dense ≤2e-4); early
-@@ -343,12 +410,33 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+@@ -343,12 +425,33 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                              tile_size=vsa_tile_size,
                              ref_keep_rate=vsa_ref_keep_rate,
                          )
@@ -805,7 +1206,7 @@ index d833399..df8c4ff 100644
                      with self._pdd_head_fusion(
                              pdd_plan,
                              index), trace_step(index), nvtx_range(f"minimax_h3.step{index}"), set_forward_context(
-@@ -367,8 +455,11 @@ class MiniMaxH3DenoisingStage(PipelineStage):
+@@ -367,8 +470,11 @@ class MiniMaxH3DenoisingStage(PipelineStage):
                              video_indices=video_indices,
                              audio_indices=audio_indices,
                              text_indices=text_indices,

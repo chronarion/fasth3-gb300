@@ -5,6 +5,9 @@ The VAE hands over each finalized temporal chunk's yuv420p frames (already copyi
 CUDA event; a writer thread waits for the copy and feeds the frames to an ffmpeg process that encodes a video-only
 MP4. Saving then only muxes the audio next to it (``finish`` + ``VideoGenerator._mux_streamed_video``), so the H.264
 encode overlaps the decode instead of following it. Same encoder and settings as the single-pass save.
+
+The server may finish a clip's save (``finish`` + mux) after the next clip has started (FASTVIDEO_H3_DEFER_SAVE); the
+decode stage then calls ``wait_previous`` before it overwrites the pinned buffers the previous save may still read.
 """
 from __future__ import annotations
 
@@ -27,7 +30,12 @@ logger = init_logger(__name__)
 class YuvStreamEncoder:
     """A video-only H.264 encode fed chunk by chunk from a pinned [frames, H * W * 3 / 2] yuv420p buffer."""
 
+    _last: YuvStreamEncoder | None = None
+
     def __init__(self, yuv: torch.Tensor, width: int, height: int, fps: int) -> None:
+        # set once nothing reads ``yuv`` any more (the save is done with it, or the encode was aborted)
+        self.released = threading.Event()
+        YuvStreamEncoder._last = self
         self.yuv = yuv
         self.fps = fps
         self.frames = 0
@@ -47,6 +55,16 @@ class YuvStreamEncoder:
         self.chunks: queue.Queue[Any] = queue.Queue()
         self.thread = threading.Thread(target=self._write, name="h3-yuv-stream", daemon=True)
         self.thread.start()
+
+    @classmethod
+    def wait_previous(cls, timeout: float = 120.0) -> None:
+        """Block until the last encoder's save has released its pinned buffer (it shares the next clip's buffers)."""
+        last = cls._last
+        if last is not None and not last.released.wait(timeout):
+            logger.warning("The previous clip's save still holds the yuv buffer after %.0f s", timeout)
+
+    def release(self) -> None:
+        self.released.set()
 
     @staticmethod
     def supported() -> bool:
@@ -90,6 +108,7 @@ class YuvStreamEncoder:
         self.proc.wait()
         self.thread.join(timeout=5)
         shutil.rmtree(self.dir, ignore_errors=True)
+        self.release()
 
     def cleanup(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)

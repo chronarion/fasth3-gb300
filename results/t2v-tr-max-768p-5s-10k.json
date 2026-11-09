@@ -4,24 +4,27 @@
   "size": "server default",
   "frames": "server default",
   "prompt": "long-10k.txt",
-  "first_s": 13.59,
-  "done_s": 10.149,
-  "fetched_s": 10.162,
-  "pipeline_s": 9.967,
+  "lora": null,
+  "first_s": 14.47,
+  "done_s": 9.999,
+  "fetched_s": 10.01,
+  "pipeline_s": 9.74,
   "runs_done": [
-    10.14,
-    10.16
+    10.0,
+    9.92,
+    10.0
   ],
   "stages_ms": {
-    "input_preparation_stage": 0.1,
-    "conditioning_stage": 680.5,
-    "latent_preparation_stage": 26.1,
-    "denoising_stage": 8192.6,
-    "video_decoding_stage": 997.2,
-    "audio_decoding_stage": 70.6
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 547.5,
+    "latent_preparation_stage": 25.7,
+    "denoising_stage": 8116.3,
+    "video_decoding_stage": 983.9,
+    "audio_decoding_stage": 67.3
   },
   "samples": [
-    "video_gen_9671e4ce493e431982b2170abfb04c71.mp4",
-    "video_gen_52ba5298d8a14df48af458b66148b7df.mp4"
+    "video_gen_518ec64286454758b2b1015525d57e9f.mp4",
+    "video_gen_cd3c7f7c4e7c4bf7bd367fc1eb8c69cf.mp4",
+    "video_gen_9a2c21128c0a4dd9a54c9aa162299a58.mp4"
   ]
 }

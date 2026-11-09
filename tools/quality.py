@@ -38,6 +38,8 @@ def main() -> None:
     ap.add_argument("--container", default=None, help="default fasth3-SERVICE")
     ap.add_argument("--prompt-file", default=None, help="use this text (behind distinct \"Take N.\" prefixes) for the "
                     "four prompts instead of the short ones, e.g. tools/prompts/long-1k.txt")
+    ap.add_argument("--lora", default=None, help="LoRA adapter name (a file in serve/loras without .safetensors)")
+    ap.add_argument("--lora-scale", type=float, default=None, help="LoRA strength (the adapter's default when unset)")
     a = ap.parse_args()
     omni = a.service == "omni"
     if omni and not a.ref:
@@ -56,6 +58,8 @@ def main() -> None:
         body = {"model": "fasth3-omni" if omni else "fasth3", "prompt": prompt, "seed": 1234}
         if omni:
             body["image_reference"] = [{"image_url": a.ref}]
+        if a.lora:
+            body["lora"] = {"name": a.lora} if a.lora_scale is None else {"name": a.lora, "scale": a.lora_scale}
         job = call("/videos", body)
         while job["status"] not in ("completed", "failed"):
             time.sleep(0.2)

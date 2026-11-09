@@ -7,16 +7,17 @@ video model: it turns a prompt into a 1344×768 video with stereo audio in 8 ste
 It is a set of changes to [FastVideo](https://github.com/hao-ai-lab/FastVideo), the software FastH3 normally runs on,
 plus a ready-to-run server. The model itself is unchanged.
 
-On one GB300, a 5-second clip with sound takes **11.47 s** from request to finished video file, as accurate as
+On one GB300, a 5-second clip with sound takes **11.43 s** from request to finished video file, as accurate as
 FastVideo's own standard 8-bit setting. FastVideo alone takes 17.32 s on the same GPU with all of its speed
-options, or 34.59 s as installed. Presets that trade a little accuracy for speed go down to **7.35 s**, and
-the optional token-reduction add-on takes that to 5.31 s, at the cost of a different video for the same seed
+options, or 34.59 s as installed. Presets that trade a little accuracy for speed go down to **7.38 s**, and
+the optional token-reduction add-on takes that to 5.24 s, at the cost of a different video for the same seed
 (see [Presets](#presets)).
-FastH3 Omni, which also takes reference images, video or audio, takes 18.84 s per 5-second clip, down to
-15.40 s.
+FastH3 Omni, which also takes reference images, video or audio, takes 18.74 s per 5-second clip, down to
+15.25 s. When requests queue up, a new 5-second clip finishes every **11.40 s** (5.3 per minute;
+see [Clips back to back](#clips-back-to-back)).
 
-At 832×480 (480p) a 5-second clip takes **4.01 s** (**2.71 s** with `max`), and at 640×640, the size
-ComfyUI's FastH3 template uses by default, 3.79 s (2.49 s). For comparison, a published run of
+At 832×480 (480p) a 5-second clip takes **3.92 s** (**2.69 s** with `max`), and at 640×640, the size
+ComfyUI's FastH3 template uses by default, 3.76 s (2.50 s). For comparison, a published run of
 ComfyUI's official FastH3 template on an RTX 5090 home GPU took 18.7 s for the same 5-second 832×480 clip and
 50.8-52.8 s at 1344×768. The GPUs differ, so this compares setups, not chips; see
 [Differences from ComfyUI's FastH3 workflow](#differences-from-comfyuis-fasth3-workflow).
@@ -42,18 +43,18 @@ per request.
 
 | Preset | Model math | Attention math | 5 s clip | 10 s clip | 15 s clip | Error (video / audio) |
 |---|---|---|---:|---:|---:|---|
-| Default | 8-bit | 16-bit | 11.47 s | 28.66 s | 54.71 s | 0.192 / 0.070 |
-| `fast` | 8-bit | partly 8-bit | 10.80 s | 25.44 s | 47.14 s | 0.197 / 0.075 |
-| `qad-nvfp4` | 4-bit (QAD model) | partly 8-bit | 8.37 s | 20.78 s | 39.98 s | 0.271 / 0.158 |
-| `max` | 4-bit (QAD model) | 8-bit | 7.35 s | 17.86 s | 33.75 s | 0.282 / 0.167 |
-| `preview` | 4-bit (QAD model) | 8-bit, lighter decoder | 6.68 s | 16.46 s | 31.47 s | 0.282 / 0.167 (same as `max`; softer decoder) |
-| Default + token reduction | 8-bit | 16-bit; middle blocks at half width | 7.90 s | 18.80 s | 34.40 s | 0.346 / 0.115 |
-| `max` + token reduction | 4-bit (QAD model) | 8-bit; middle blocks at half width | 5.31 s | 12.17 s | 22.00 s | 0.320 / 0.177 |
-| Omni, 1 reference image | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 16-bit | 18.84 s | 35.45 s | 55.49 s | 0.219 / 0.111 |
-| `omni-fast` | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 8-bit | 15.77 s | 29.45 s | 46.33 s | 0.226 / 0.119 |
-| `omni-max` | 4-bit (Omni QAD model) | 8-bit | 15.40 s | 28.29 s | 44.16 s | 0.230 / 0.117 |
-| Omni + token reduction | 4-bit (Omni QAD model) | partly 8-bit; middle blocks at half width | 14.62 s | 25.82 s | 38.97 s | 0.271 / 0.124 |
-| `omni-max` + token reduction | 4-bit (Omni QAD model) | 8-bit; middle blocks at half width | 12.08 s | 20.89 s | 31.34 s | 0.277 / 0.128 |
+| Default | 8-bit | 16-bit | 11.43 s | 28.21 s | 53.46 s | 0.191 / 0.070 |
+| `fast` | 8-bit | partly 8-bit | 10.67 s | 25.23 s | 46.62 s | 0.197 / 0.075 |
+| `qad-nvfp4` | 4-bit (QAD model) | partly 8-bit | 8.27 s | 20.65 s | 39.69 s | 0.271 / 0.159 |
+| `max` | 4-bit (QAD model) | 8-bit | 7.38 s | 17.76 s | 33.52 s | 0.283 / 0.166 |
+| `preview` | 4-bit (QAD model) | 8-bit, lighter decoder | 6.54 s | 16.03 s | 30.87 s | 0.283 / 0.166 (same as `max`; softer decoder) |
+| Default + token reduction | 8-bit | 16-bit; middle blocks at half width | 7.75 s | 18.34 s | 33.59 s | 0.348 / 0.118 |
+| `max` + token reduction | 4-bit (QAD model) | 8-bit; middle blocks at half width | 5.24 s | 11.96 s | 21.70 s | 0.320 / 0.177 |
+| Omni, 1 reference image | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 16-bit | 18.74 s | 35.01 s | 54.85 s | 0.220 / 0.111 |
+| `omni-fast` | 4-bit (Omni QAD model) | partly 8-bit; prompt and reference in 8-bit | 15.61 s | 29.13 s | 45.81 s | 0.226 / 0.117 |
+| `omni-max` | 4-bit (Omni QAD model) | 8-bit | 15.25 s | 27.97 s | 43.68 s | 0.231 / 0.116 |
+| Omni + token reduction | 4-bit (Omni QAD model) | partly 8-bit; middle blocks at half width | 14.52 s | 25.60 s | 38.69 s | 0.271 / 0.124 |
+| `omni-max` + token reduction | 4-bit (Omni QAD model) | 8-bit; middle blocks at half width | 11.98 s | 20.71 s | 31.07 s | 0.277 / 0.128 |
 
 **Error** is how far a preset's predictions drift from the full-precision (16-bit) model, given exactly the same input
 at each of the 8 steps, averaged over four prompts. Lower is better; 0 would be identical. FastVideo's own standard
@@ -71,46 +72,58 @@ gives a different video: in our checks the picture stays as clean, while the fra
 change. The idea comes from antirez's h3.c; this is FastVideo's version of it, run on this repository's fast path.
 
 Other sizes and prompt lengths. Long prompts take longer, because every part of the video looks at the whole prompt.
-Error with a 1,000-token prompt: 0.243 / 0.082; with a 10,000-token prompt: 0.256 / 0.062.
+Error with a 1,000-token prompt: 0.242 / 0.081; with a 10,000-token prompt: 0.259 / 0.065.
 
 | Preset | Request | Total |
 |---|---|---:|
-| Default | 832×480, 5 s | 4.01 s |
-| Default | 768×1344 (portrait), 5 s | 11.81 s |
-| Default | 640×640 (ComfyUI template's size), 5 s | 3.79 s |
-| Default | 5 s, 1,000-token prompt | 12.41 s |
-| Default | 10 s, 1,000-token prompt | 29.90 s |
-| Default | 15 s, 1,000-token prompt | 55.48 s |
-| Default | 5 s, 10,000-token prompt | 19.67 s |
-| Default | 10 s, 10,000-token prompt | 41.81 s |
-| Default | 15 s, 10,000-token prompt | 72.47 s |
-| Default | 5 s, same prompt again (re-roll) | 11.46 s |
-| Default | 5 s, same 10,000-token prompt again (re-roll) | 19.23 s |
-| `fast` | 832×480, 5 s | 3.86 s |
-| `qad-nvfp4` | 832×480, 5 s | 2.92 s |
-| `max` | 832×480, 5 s | 2.71 s |
-| `max` | 640×640, 5 s | 2.49 s |
-| `max` | 5 s, 1,000-token prompt | 8.11 s |
-| `max` | 10 s, 1,000-token prompt | 18.90 s |
-| `max` | 15 s, 1,000-token prompt | 35.01 s |
-| `fast` | 5 s, 10,000-token prompt | 18.91 s |
-| `fast` | 10 s, 10,000-token prompt | 38.94 s |
-| `fast` | 15 s, 10,000-token prompt | 65.51 s |
-| `qad-nvfp4` | 5 s, 10,000-token prompt | 16.05 s |
-| `max` | 5 s, 10,000-token prompt | 13.18 s |
-| `max` | 10 s, 10,000-token prompt | 27.36 s |
-| `max` | 15 s, 10,000-token prompt | 46.67 s |
-| `preview` | 832×480, 5 s | 2.39 s |
-| `preview` | 5 s, 10,000-token prompt | 12.43 s |
-| Default + token reduction | 832×480, 5 s | 2.93 s |
+| Default | 832×480, 5 s | 3.92 s |
+| Default | 768×1344 (portrait), 5 s | 11.58 s |
+| Default | 640×640 (ComfyUI template's size), 5 s | 3.76 s |
+| Default | 5 s, 1,000-token prompt | 12.28 s |
+| Default | 10 s, 1,000-token prompt | 29.57 s |
+| Default | 15 s, 1,000-token prompt | 54.58 s |
+| Default | 5 s, 10,000-token prompt | 19.84 s |
+| Default | 10 s, 10,000-token prompt | 41.76 s |
+| Default | 15 s, 10,000-token prompt | 72.00 s |
+| Default | 5 s, same prompt again (re-roll) | 11.19 s |
+| Default | 5 s, same 10,000-token prompt again (re-roll) | 18.91 s |
+| `fast` | 832×480, 5 s | 3.82 s |
+| `qad-nvfp4` | 832×480, 5 s | 2.88 s |
+| `max` | 832×480, 5 s | 2.69 s |
+| `max` | 640×640, 5 s | 2.50 s |
+| `max` | 5 s, 1,000-token prompt | 8.08 s |
+| `max` | 10 s, 1,000-token prompt | 18.88 s |
+| `max` | 15 s, 1,000-token prompt | 35.23 s |
+| `fast` | 5 s, 10,000-token prompt | 19.23 s |
+| `fast` | 10 s, 10,000-token prompt | 39.16 s |
+| `fast` | 15 s, 10,000-token prompt | 65.83 s |
+| `qad-nvfp4` | 5 s, 10,000-token prompt | 16.36 s |
+| `max` | 5 s, 10,000-token prompt | 13.43 s |
+| `max` | 10 s, 10,000-token prompt | 26.90 s |
+| `max` | 15 s, 10,000-token prompt | 45.97 s |
+| `preview` | 832×480, 5 s | 2.34 s |
+| `preview` | 5 s, 10,000-token prompt | 12.53 s |
+| Default + token reduction | 832×480, 5 s | 2.87 s |
 | Default + token reduction | 5 s, 10,000-token prompt | 14.49 s |
-| `max` + token reduction | 832×480, 5 s | 2.10 s |
-| `max` + token reduction | 5 s, 10,000-token prompt | 9.93 s |
-| Omni | 832×480, 5 s | 10.00 s |
-| Omni | 5 s, same reference image again (processed once) | 18.31 s |
-| `omni-max` | 832×480, 5 s | 8.36 s |
+| `max` + token reduction | 832×480, 5 s | 2.05 s |
+| `max` + token reduction | 5 s, 10,000-token prompt | 10.00 s |
+| Omni | 832×480, 5 s | 9.93 s |
+| Omni | 5 s, same reference image again (processed once) | 17.92 s |
+| `omni-max` | 832×480, 5 s | 8.26 s |
 
 Per-step timings of every run (prompt reading, video generation, decoding): `results/`.
+
+### Clips back to back
+
+When several requests wait in line, the server starts the next clip while it finishes writing the previous clip's
+file, so a clip comes out more often than one request at a time would suggest. Time between finished clips with
+requests waiting, short prompt:
+
+| Preset | 5 s clips | 10 s clips | 15 s clips | One request at a time, 5 s |
+|---|---:|---:|---:|---:|
+| Default | 11.40 s | 28.14 s | 53.02 s | 11.43 s |
+| `max` | 7.23 s | - | - | 7.38 s |
+| Omni, 1 reference image | 18.75 s | - | - | 18.74 s |
 
 ### FastVideo on the same GPU
 
@@ -120,8 +133,8 @@ The same model and requests on the same GB300, run by FastVideo alone. Total tim
 |---|---|---:|---:|---:|---:|
 | FastVideo `a01c50a`, as installed | 16-bit model, FastVideo's standard decoder, nothing compiled; its Docker image with only the library fix from [Notes](#notes) | 34.59 s | 78.81 s | 137.3 s | 11.87 s |
 | FastVideo `a01c50a`, all of its speed options | 8-bit model math, its combined GPU steps (`FUSIONS=mk`), its fastest sparse attention code, its compiled 4-bit quality decoder with FlashAttention-4, whole frames decoded in one batch | 17.32 s | 40.26 s | 73.75 s | 6.14 s |
-| This repository, default | 8-bit model math, 16-bit attention | 11.47 s | 28.66 s | 54.71 s | 4.01 s |
-| This repository, `max` | 4-bit model (QAD), 8-bit attention | 7.35 s | 17.86 s | 33.75 s | 2.71 s |
+| This repository, default | 8-bit model math, 16-bit attention | 11.43 s | 28.21 s | 53.46 s | 3.92 s |
+| This repository, `max` | 4-bit model (QAD), 8-bit attention | 7.38 s | 17.76 s | 33.52 s | 2.69 s |
 
 ### Published numbers from other systems
 
@@ -131,26 +144,26 @@ re-measured here; GPU counts and model versions differ (FastH3 V2 unless noted).
 
 | System | GPUs | Number format | Clip | What is timed | Their time | This repository, 1 GB300 (default / `max`) |
 |---|---|---|---|---|---:|---:|
-| UniServe (FastVideo) | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 5.62 s | 12.42 s / 8.12 s |
-| UniServe (FastVideo) | 4× GB200 | 4-bit in part of the model and the decoder | 5 s, 1,000-token prompt | request to downloaded MP4 | 4.49 s | 12.42 s / 8.12 s |
-| FastVideo, tuned by the UniServe team | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 7.47 s | 12.42 s / 8.12 s |
-| SGLang, tuned by the UniServe team | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 7.07 s | 12.42 s / 8.12 s |
-| vLLM-Omni, tuned by the UniServe team | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 7.69 s | 12.42 s / 8.12 s |
-| UniServe (FastVideo) | 8× GB200 (2 machines) | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 3.13 s | 12.42 s / 8.12 s |
-| UniServe (FastVideo) | 4× GB200 | 16-bit | 5 s, 10,000-token prompt | request to downloaded MP4 | 8.80 s | 19.69 s / 13.19 s |
-| UniServe (FastVideo) | 4× GB200 | 16-bit | 10 s, 1,000-token prompt | request to downloaded MP4 | 11.73 s | 29.93 s / 18.92 s |
-| UniServe (FastVideo) | 4× GB200 | 16-bit | 15 s, 1,000-token prompt | request to downloaded MP4 | 20.27 s | 55.51 s / 35.05 s |
-| UniServe (FastVideo) | 4× GB200 | 16-bit | 10 s, 10,000-token prompt | request to downloaded MP4 | 16.75 s | 41.83 s / 27.38 s |
-| UniServe (FastVideo) | 4× GB200 | 16-bit | 15 s, 10,000-token prompt | request to downloaded MP4 | 27.31 s | 72.51 s / 46.70 s |
-| UniServe (FastVideo) | 8× RTX PRO 6000 Server | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 19.12 s | 12.42 s / 8.12 s |
-| Sol-H3 (NVIDIA), 4 steps, full attention | 1× B300 | not stated | 5 s (124 frames) | prompt reading to decoded video, no MP4 file | 11.48 s | 11.35 s / 7.23 s |
-| Sol-H3 (NVIDIA), 4 steps, full attention | 1× B300 | not stated | 10 s (243 frames) | prompt reading to decoded video, no MP4 file | 28.18 s | 28.41 s / 17.59 s |
-| Sol-H3 (NVIDIA), 4 steps, full attention | 1× B300 | not stated | 15 s (362 frames) | prompt reading to decoded video, no MP4 file | 50.71 s | 54.38 s / 33.39 s |
-| Sol-H3 (NVIDIA), 4 steps, sparse attention | 8× B300 | partly 8-bit | 5 s (124 frames) | prompt reading to decoded video, no MP4 file | 1.65 s | 11.35 s / 7.23 s |
-| ComfyUI 0.37, official template | 1× RTX 5090 | 4-bit | 5 s, text to video | submit to saved MP4 | 50.8-52.8 s | 11.47 s / 7.35 s |
-| ComfyUI 0.37, official template | 1× RTX 5090 | 4-bit | 832×480, 5 s, text to video | submit to saved MP4 | 18.7 s | 4.01 s / 2.71 s |
-| FastVideo (its own published figures) | 1× RTX 5090 | not stated | 5 s | prompt reading to MP4 | 38.6 s | 11.47 s / 7.35 s |
-| FastVideo (its own published figures) | 1× RTX 5090 | not stated | 832×480, 5 s | prompt reading to MP4 | 14.8 s | 4.01 s / 2.71 s |
+| UniServe (FastVideo) | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 5.62 s | 12.29 s / 8.09 s |
+| UniServe (FastVideo) | 4× GB200 | 4-bit in part of the model and the decoder | 5 s, 1,000-token prompt | request to downloaded MP4 | 4.49 s | 12.29 s / 8.09 s |
+| FastVideo, tuned by the UniServe team | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 7.47 s | 12.29 s / 8.09 s |
+| SGLang, tuned by the UniServe team | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 7.07 s | 12.29 s / 8.09 s |
+| vLLM-Omni, tuned by the UniServe team | 4× GB200 | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 7.69 s | 12.29 s / 8.09 s |
+| UniServe (FastVideo) | 8× GB200 (2 machines) | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 3.13 s | 12.29 s / 8.09 s |
+| UniServe (FastVideo) | 4× GB200 | 16-bit | 5 s, 10,000-token prompt | request to downloaded MP4 | 8.80 s | 19.85 s / 13.45 s |
+| UniServe (FastVideo) | 4× GB200 | 16-bit | 10 s, 1,000-token prompt | request to downloaded MP4 | 11.73 s | 29.59 s / 18.90 s |
+| UniServe (FastVideo) | 4× GB200 | 16-bit | 15 s, 1,000-token prompt | request to downloaded MP4 | 20.27 s | 54.61 s / 35.26 s |
+| UniServe (FastVideo) | 4× GB200 | 16-bit | 10 s, 10,000-token prompt | request to downloaded MP4 | 16.75 s | 41.78 s / 26.92 s |
+| UniServe (FastVideo) | 4× GB200 | 16-bit | 15 s, 10,000-token prompt | request to downloaded MP4 | 27.31 s | 72.03 s / 46.00 s |
+| UniServe (FastVideo) | 8× RTX PRO 6000 Server | 16-bit | 5 s, 1,000-token prompt | request to downloaded MP4 | 19.12 s | 12.29 s / 8.09 s |
+| Sol-H3 (NVIDIA), 4 steps, full attention | 1× B300 | not stated | 5 s (124 frames) | prompt reading to decoded video, no MP4 file | 11.48 s | 11.30 s / 7.26 s |
+| Sol-H3 (NVIDIA), 4 steps, full attention | 1× B300 | not stated | 10 s (243 frames) | prompt reading to decoded video, no MP4 file | 28.18 s | 28.04 s / 17.58 s |
+| Sol-H3 (NVIDIA), 4 steps, full attention | 1× B300 | not stated | 15 s (362 frames) | prompt reading to decoded video, no MP4 file | 50.71 s | 53.06 s / 33.25 s |
+| Sol-H3 (NVIDIA), 4 steps, sparse attention | 8× B300 | partly 8-bit | 5 s (124 frames) | prompt reading to decoded video, no MP4 file | 1.65 s | 11.30 s / 7.26 s |
+| ComfyUI 0.37, official template | 1× RTX 5090 | 4-bit | 5 s, text to video | submit to saved MP4 | 50.8-52.8 s | 11.43 s / 7.38 s |
+| ComfyUI 0.37, official template | 1× RTX 5090 | 4-bit | 832×480, 5 s, text to video | submit to saved MP4 | 18.7 s | 3.92 s / 2.69 s |
+| FastVideo (its own published figures) | 1× RTX 5090 | not stated | 5 s | prompt reading to MP4 | 38.6 s | 11.43 s / 7.38 s |
+| FastVideo (its own published figures) | 1× RTX 5090 | not stated | 832×480, 5 s | prompt reading to MP4 | 14.8 s | 3.92 s / 2.69 s |
 
 Sources: [UniServe](https://haoailab.com/blogs/uniserve-fasth3/) (FastVideo's own serving system; its comparison
 systems were tuned by the same team), [Sol-H3](https://nvlabs.github.io/Sana/Sol-Engine/Sol-H3/) (NVIDIA; an older
@@ -168,8 +181,8 @@ its time per video divided by the video's length. Over the same mix:
 | UniServe (FastVideo), 16-bit | 4× GB200 | ~6,100 | 5.8 |
 | UniServe (FastVideo), 16-bit | 8× GB200 | ~11,000 | 6.4 |
 | UniServe (FastVideo), 16-bit | 8× RTX PRO 6000 Server | ~3,400 | 21.2 |
-| This repository, default (8-bit) | 1× GB300 | 2,237 | 3.8 |
-| This repository, `max` (4-bit) | 1× GB300 | 3,474 | 2.5 |
+| This repository, default (8-bit) | 1× GB300 | 2,254 | 3.8 |
+| This repository, `max` (4-bit) | 1× GB300 | 3,491 | 2.4 |
 
 ### How we measured
 
@@ -186,9 +199,9 @@ its time per video divided by the video's length. Over the same mix:
   again".
 - **Runs:** each number is the median of 6 timed clips (3 for long prompts, 2 for 10 and 15-second clips), after one
   untimed clip, with seed 1234. The benchmark repeats its four short prompts, so the prompt cache is off for every
-  row except the re-roll rows.
-- **Which release:** each row comes from the release that last changed it. Later releases only made the older rows
-  a little faster (the streamed video encode of 1.4 takes about 0.07 s off a 5-second clip).
+  row except the re-roll rows. Back-to-back rows submit the timed clips together after the untimed one and report
+  the median time between consecutive finished clips (`tools/bench.py --back-to-back`).
+- **Which release:** every row was measured with release 1.5.
 - **What is timed:** *total* runs from the request until the server has written the MP4 file. *Downloaded* also
   includes downloading the file. *Without making the MP4* covers reading the prompt, generating the video and decoding
   it, but not writing the video file.
@@ -302,9 +315,9 @@ are from one GB300, request to finished MP4. Every row is a 5-second clip:
 
 | Size | ComfyUI template, RTX 5090 | FastVideo, RTX 5090 | This server, default | This server, `max` |
 |---|---:|---:|---:|---:|
-| 832×480 (480p) | 18.7 s | 14.8 s | 4.01 s | 2.71 s |
-| 640×640 (the template's default size) | - | - | 3.79 s | 2.49 s |
-| 1344×768 | 50.8-52.8 s | 38.6 s | 11.47 s | 7.35 s |
+| 832×480 (480p) | 18.7 s | 14.8 s | 3.92 s | 2.69 s |
+| 640×640 (the template's default size) | - | - | 3.76 s | 2.50 s |
+| 1344×768 | 50.8-52.8 s | 38.6 s | 11.43 s | 7.38 s |
 
 The template itself makes 2-second clips at 640×640; FastVideo's server does not make H3 clips under 5 seconds, so
 the 640×640 row is a 5-second clip and has no published ComfyUI time to set beside it.
@@ -330,6 +343,13 @@ Measured on 5-second 1344×768 text-to-video clips unless noted; each change bui
 | **The same prompt again is not read twice** (1.4) | a re-roll skips the prompt reader: -0.55 s with a 10,000-token prompt | FastVideo's reference memo, extended to text prompts |
 | **Video encoded during decoding** (1.4): each finished chunk goes to the H.264 encoder while the next one decodes | 5 s clip: 0.17 → 0.12 s after decoding | |
 | **Token reduction** (1.4, optional add-on): the middle blocks work on a half-width video | the 8 model passes 10.25 → 6.61 s, 5 s clip 11.57 → 7.94 s; a different video for the same seed | antirez's h3.c; FastVideo |
+| **Hardware exponentials in the 16-bit attention** (1.5): a copy of FastVideo's attention code that computes every exponential on the GPU's built-in unit and gets each row's maximum from the same instruction that loads the scores (`h3fast/vsa_bf16.cuh`) | attention 2.5-2.8% faster; default 5 s clip −0.10 s | FlashAttention-4 |
+| **Two GPU queues per block** (1.5): the gate projection and the compressed attention branch run beside the rest of the attention | −0.035 s per clip, identical results | |
+| **Video decoder programs resized** (1.5): FastVideo's 4-bit decoder kernels handle 1 or 4 rows per program instead of 2 or 4; the output is bit-identical | those kernels up to 1.54× faster on their own; decoding about 0.01 s faster per clip | |
+| **Short prompts on FlashAttention** (1.5): cuDNN's attention in the prompt reader only from 4,096 tokens; it spends about 30 ms preparing for every prompt length it has not seen | −30 ms on every request with a new prompt (the benchmark repeats its prompts, so its rows do not show this) | |
+| **Fewer waits before the model passes** (1.5): the per-step timing tables are built at once and copied to the GPU in one go | about −0.02 s | |
+| **Writing the file while the next clip starts** (1.5): with requests waiting, the end of the video encode and the audio track finish after the next clip has started | queued 5 s clips 11.49 → 11.40 s each | |
+| **LoRAs folded into the weights** (1.5, 8-bit presets): the selected LoRA is merged into the model's 16-bit weights and turned into 8-bit again, on the original rounding grid, once per LoRA or strength change | a LoRA request costs nothing extra instead of 1.1 s more; changing LoRA or strength 0.1 s once | |
 
 FastVideo's own speed options are on as well: its fast attention code for this GPU, decoding the whole frame in one
 batch, its 4-bit quality decoder, 8-bit model math and a compiled video decoder.
@@ -357,6 +377,20 @@ batch, its 4-bit quality decoder, 8-bit model math and a compiled video decoder.
   log-sum-exp merge in the gate kernel joins them. Both sparse kernels return their log-sum-exp for the merge (the
   8-bit one from its correction warps, which combine each row's two halves).
 - **Tile selection** scores in TF32 (`FASTVIDEO_H3_TF32_SCORES=0`: fp32).
+- **16-bit attention** (`h3fast/vsa_bf16.cuh`, `FASTVIDEO_H3_BF16_VSA=stock` for FastVideo's own op): FastVideo's
+  blk64 / blk128 kernels with every `ex2` on the SFU (no FMA emulation) and the `tcgen05.ld.red` row max; the results
+  differ from FastVideo's op by 3e-4 to 9e-4 (relative), the teacher-forced error is unchanged within run-to-run noise.
+- **Side stream** (`FASTVIDEO_H3_SIDE_STREAM=0` turns it off): the gate-compress GEMM overlaps the prologue, scores and
+  top-k; softmax(scores) @ pooled V overlaps the sparse attention; the gate kernel waits for both.
+- **Decoder launches:** `qkv_epilogue` rows per program 2 → 1, `swiglu_quantize` 2 → 4, `residual_norm_quantize`
+  4 → 1, tuned at the 1344×768 decode shape (50,316 tokens × 2,048); every output compared with `torch.equal`.
+- **Deferred save** (`FASTVIDEO_H3_DEFER_SAVE`): the clip's yuv stream is finished and muxed on a save thread after
+  the server releases the pipeline; the job turns `completed` when the file is written, and the next decode waits for
+  the previous save before it reuses the pinned frame buffers.
+- **LoRA merge** (`FASTVIDEO_H3_LORA_MERGE`, on when `serve/loras` holds a LoRA): the 16-bit weights of every 8-bit
+  linear stay in one page-locked host buffer (~40 GB); the merged weight is quantized with the base weight's scale
+  (a fresh scale measured 1-3% more error), or its own if the merge outgrows that range by more than 5%. Cached per
+  LoRA file and strength; strength 0 uses the base weights.
 
 </details>
 
@@ -398,10 +432,12 @@ the prompt where the image belongs; reference files go in `serve/media/in`.
 **LoRAs.** Put LoRA files (`.safetensors`) in `serve/loras/` and restart the service. FastVideo reads the layouts
 that ComfyUI, fal, ai-toolkit and musubi-tuner write. Each file is offered under its file name without
 `.safetensors`, and a request picks one with `"lora": {"name": "<file name>", "scale": 0.8}` (scale from 0 to 2,
-0.8 when left out; `GET /v1/model_info` lists what is loaded). A LoRA runs beside the model's 8-bit or 4-bit weights
-on the fast path instead of being merged into them, so each request can use a different LoRA, or none. fal's
-realism LoRA (rank 32, on the attention projections) adds
-1.1 s with the default preset and 0.6 s with `max` to a 5-second clip.
+0.8 when left out; `GET /v1/model_info` lists what is loaded). Each request can use a different LoRA, or none. On
+the 8-bit presets (default and `fast`) the selected LoRA is folded into the model's weights: the server keeps the
+16-bit weights in host memory (about 40 GB, only when `serve/loras` holds a LoRA) and rebuilds the 8-bit weights of
+the layers the LoRA touches when a request asks for a different LoRA or strength, which takes about 0.1 s once. On the
+4-bit presets a LoRA runs beside the weights. fal's realism LoRA (rank 32, on the attention projections), 5-second
+clip: nothing extra on the default preset (runs with and without it alternating on one server), 0.1 s more on `fast`, 0.5 s more on `max` (7.92 s vs 7.38 s).
 Most community LoRAs were trained on the original 50-step MiniMax-H3. Style, character and camera-motion LoRAs
 usually carry over to FastH3, but the best strength can differ; "turbo" or step-reduction LoRAs are not meant for
 it. LoRAs are third-party weights with their own licenses.

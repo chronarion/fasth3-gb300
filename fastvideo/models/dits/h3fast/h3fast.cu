@@ -990,6 +990,16 @@ torch::Tensor vsa_pair_op(torch::Tensor q, torch::Tensor k, torch::Tensor v, tor
                           torch::Tensor u_num, torch::Tensor vbs, double sm_scale, std::optional<torch::Tensor> v_scale_blk,
                           std::optional<torch::Tensor> v_scale_head, std::optional<torch::Tensor> lse);
 
+// h3attn16.cu / h3attn16b.cu: FastVideo's BF16 VSA kernel (64- / 128-token blocks) with the ld.red row max and every
+// exp on the hardware ex2; same arguments and results as block_sparse_ptx_blackwell_fwd.
+std::vector<torch::Tensor> vsa_bf16_op(torch::Tensor q, torch::Tensor k, torch::Tensor v, c10::optional<torch::Tensor> v_t,
+                                       torch::Tensor q2k_idx, torch::Tensor q2k_num, torch::Tensor variable_block_sizes,
+                                       double sm_scale, bool need_lse);
+std::vector<torch::Tensor> vsa_bf16_blk128_op(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                              c10::optional<torch::Tensor> v_t, torch::Tensor q2k_idx,
+                                              torch::Tensor q2k_num, torch::Tensor variable_block_sizes,
+                                              double sm_scale, bool need_lse);
+
 void attn_gate_quant_op(torch::Tensor ob, std::optional<torch::Tensor> g, std::optional<torch::Tensor> sg,
                         std::optional<torch::Tensor> oc, torch::Tensor slot, int64_t n_tiles, int64_t tile,
                         torch::Tensor a, std::optional<torch::Tensor> asf, torch::Tensor sa, int64_t rows,
@@ -1056,6 +1066,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("vsa_fp8", &vsa_fp8_op);
   m.def("topk_pairs", &topk_pairs_op);
   m.def("vsa_pair", &vsa_pair_op);
+  m.def("vsa_bf16", &vsa_bf16_op);
+  m.def("vsa_bf16_blk128", &vsa_bf16_blk128_op);
   m.def("v_to_fp8", &v_to_fp8_op);
   m.def("fp4_dequant", &fp4_dequant_op);
 }

@@ -5,10 +5,13 @@ Reports, per clip and as medians over the timed clips:
   fetched_s   submit -> last byte of the MP4 received by the client (the scope of FastVideo's UniServe benchmark)
   pipeline_s  sum of the pipeline stage times the server logs: text encoding, latent setup, denoising, video and audio
               decode; no MP4 encode (the scope of NVIDIA's Sol-H3 table)
-plus the median of each stage.
+plus the median of each stage. With --back-to-back the timed clips are submitted together (the server renders them one
+after another) and it also reports b2b_interval_s, the median time between consecutive completions: the time per clip
+when requests queue up.
 
     python3 bench.py LABEL [--service t2v|omni] [--n 6] [--width 1344 --height 768 --frames 124] [--ref IMAGE]
-                     [--prompt-file FILE] [--url http://127.0.0.1:8101/v1] [--container fasth3-t2v] [--out DIR]
+                     [--prompt-file FILE] [--back-to-back] [--url http://127.0.0.1:8101/v1] [--container fasth3-t2v]
+                     [--out DIR]
 
 Omni needs a reference image path the server can read (under one of its media_roots). With --prompt-file every clip
 gets the file's text behind a distinct "Take N." prefix, so no clip can reuse another clip's text encoding.
@@ -55,6 +58,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--lora", default=None, help="LoRA adapter name (a file in serve/loras without .safetensors)")
     ap.add_argument("--lora-scale", type=float, default=None, help="LoRA strength (the adapter's default when unset)")
+    ap.add_argument("--back-to-back", action="store_true", help="submit the timed clips together and report the time "
+                    "between consecutive completions")
     ap.add_argument("--url", default="http://127.0.0.1:8101/v1")
     ap.add_argument("--container", default=None, help="container whose logs carry the stage times "
                     "(default fasth3-SERVICE; '' skips them)")
@@ -79,7 +84,7 @@ def main() -> None:
         except urllib.error.HTTPError as error:
             raise SystemExit(f"HTTP {error.code} from {path}: {error.read().decode(errors='replace')[:2000]}")
 
-    def generate(prompt: str) -> tuple[float, float, str | None]:
+    def submit(prompt: str) -> dict:
         body = {"model": "fasth3-omni" if omni else "fasth3", "prompt": prompt, "seed": a.seed}
         for key, value in (("width", a.width), ("height", a.height), ("num_frames", a.frames)):
             if value:
@@ -88,27 +93,49 @@ def main() -> None:
             body["image_reference"] = [{"image_url": a.ref}]
         if a.lora:
             body["lora"] = {"name": a.lora} if a.lora_scale is None else {"name": a.lora, "scale": a.lora_scale}
-        t0 = time.time()
-        job = call("/videos", body)
+        return call("/videos", body)
+
+    def wait(job: dict) -> dict:
         while job["status"] not in ("completed", "failed"):
             time.sleep(0.02)
             job = call(f"/videos/{job['id']}")
-        done = time.time() - t0
         if job["status"] != "completed":
             raise SystemExit(f"generation failed: {job}")
+        return job
+
+    def fetch(job: dict) -> None:
         with urllib.request.urlopen(a.url + f"/videos/{job['id']}/content", timeout=600) as r:
             while r.read(1 << 20):
                 pass
+
+    def generate(prompt: str) -> tuple[float, float, str | None]:
+        t0 = time.time()
+        job = wait(submit(prompt))
+        done = time.time() - t0
+        fetch(job)
         return done, time.time() - t0, job.get("file_path")
 
     since = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     first, _, _ = generate(prompts[0])
-    done, fetched, paths = [], [], []
-    for prompt in prompts[1:]:
-        d, f, path = generate(prompt)
-        done.append(d)
-        fetched.append(f)
-        paths.append(path)
+    done, fetched, paths, b2b = [], [], [], {}
+    if a.back_to_back:
+        t0 = time.time()
+        jobs = [submit(prompt) for prompt in prompts[1:]]
+        finished = []
+        for job in jobs:  # the server renders them in submission order
+            job = wait(job)
+            finished.append(time.time() - t0)
+            paths.append(job.get("file_path"))
+        steps = [b - a for a, b in zip(finished, finished[1:])]
+        done = [finished[0]] + steps
+        b2b = {"b2b_first_s": round(finished[0], 2), "b2b_interval_s": round(statistics.median(steps), 3),
+               "b2b_total_s": round(finished[-1], 2), "b2b_intervals": [round(x, 2) for x in steps]}
+    else:
+        for prompt in prompts[1:]:
+            d, f, path = generate(prompt)
+            done.append(d)
+            fetched.append(f)
+            paths.append(path)
 
     stages, pipeline = {}, []
     if container:
@@ -129,6 +156,7 @@ def main() -> None:
         "first_s": round(first, 2),
         "done_s": med(done), "fetched_s": med(fetched), "pipeline_s": med(pipeline),
         "runs_done": [round(x, 2) for x in done],
+        **b2b,
         "stages_ms": {k: round(statistics.median(v), 1) for k, v in stages.items()},
         "samples": paths,
     }
