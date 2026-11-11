@@ -2,11 +2,12 @@
 # Download the FastH3 weights at the revisions this release was measured with into $HF_HOME/hub, then build the composed
 # model directories the serve/ configs point at ($HF_HOME/composed/*, relative symlinks into the hub snapshots).
 #
-#   HF_HOME=/path/to/hf tools/download_models.sh [t2v] [qad] [omni]      (no argument: all three)
+#   HF_HOME=/path/to/hf tools/download_models.sh [t2v] [qad] [omni] [full]      (no argument: t2v qad omni)
 #
 #   t2v   FastVideo-FastH3-8-Step-V2 (text encoder, transformer, VAEs; ~138 GB) + the NVFP4 VAE decoders (~1.6 GB)
 #   qad   + FastH3-QAD-v2's NVFP4 transformer (~38 GB), for profiles/qad-nvfp4.env and profiles/max.env
 #   omni  + FastH3-Omni-8-Step-V1 (~66 GB) and FastH3-Omni-NVFP4-QAD's transformer (~37 GB), for the omni service
+#   full  MiniMax-H3, the full 50-step model (~134 GB without the reference-to-video transformer), for the full service
 #
 # Needs huggingface_hub's `hf` CLI (pip install -U "huggingface_hub[cli]"), ideally in a container or venv.
 set -euo pipefail
@@ -18,6 +19,7 @@ DEC=FastVideo/FastH3-NVFP4-VAE-Decoder;         DEC_REV=bd0c248f2a0f57ca643b3df2
 QAD=FastVideo/FastH3-QAD-v2;                    QAD_REV=a0dc05a76acdba7733c196b67b424889b6a2272b
 OMNI=FastVideo/FastVideo-FastH3-Omni-8-Step-V1; OMNI_REV=53e0d26a1691aa473b6262d8196a8feb2c297df0
 OQAD=FastVideo/FastH3-Omni-NVFP4-QAD;           OQAD_REV=f01e6a23ac6066aa9eb622cf94b6259442e70ec2
+FULL=MiniMaxAI/MiniMax-H3;                      FULL_REV=42ed227ee7df40d41602854ae760620d6eb651fe
 
 want() { [ $# -eq 0 ] && return 0; for x in "${ARGS[@]}"; do [ "$x" = "$1" ] && return 0; done; return 1; }
 ARGS=("$@"); [ ${#ARGS[@]} -eq 0 ] && ARGS=(t2v qad omni)
@@ -29,6 +31,11 @@ link_all() {   # link_all DIR REPO REV ENTRY...: symlink each ENTRY of REPO@REV 
     mkdir -p "$dir"
     for entry in "$@"; do ln -sfn "$src/$entry" "$dir/$entry"; done
 }
+
+if want full; then
+    hf download "$FULL" --revision "$FULL_REV" --exclude "transformer_ref/*"
+fi
+[ "${ARGS[*]}" = full ] && { echo "models ready in $HF_HOME"; exit 0; }
 
 # Every component of the t2v model; the QAD and Omni dirs reuse them.
 hf download "$V2" --revision "$V2_REV"

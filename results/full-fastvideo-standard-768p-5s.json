@@ -1,0 +1,28 @@
+{
+  "label": "fastvideo-standard-768p-5s",
+  "service": "full",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "lora": null,
+  "first_s": 160.2,
+  "done_s": 154.798,
+  "fetched_s": 154.805,
+  "pipeline_s": 154.682,
+  "runs_done": [
+    154.83,
+    154.76
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.1,
+    "conditioning_stage": 133.9,
+    "latent_preparation_stage": 25.3,
+    "denoising_stage": 153425.2,
+    "video_decoding_stage": 1024.0,
+    "audio_decoding_stage": 73.3
+  },
+  "samples": [
+    "/media/out/minimax-h3/videos/video_gen_7da9ca0c0d924dc5b658c8818917691d.mp4",
+    "/media/out/minimax-h3/videos/video_gen_07abf53c214148c0a0647031f1572c58.mp4"
+  ]
+}

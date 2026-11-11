@@ -9,7 +9,7 @@ plus the median of each stage. With --back-to-back the timed clips are submitted
 after another) and it also reports b2b_interval_s, the median time between consecutive completions: the time per clip
 when requests queue up.
 
-    python3 bench.py LABEL [--service t2v|omni] [--n 6] [--width 1344 --height 768 --frames 124] [--ref IMAGE]
+    python3 bench.py LABEL [--service t2v|omni|full] [--n 6] [--width 1344 --height 768 --frames 124] [--ref IMAGE]
                      [--prompt-file FILE] [--back-to-back] [--url http://127.0.0.1:8101/v1] [--container fasth3-t2v]
                      [--out DIR]
 
@@ -46,7 +46,7 @@ STAGES_PER_CLIP = 6
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("label")
-    ap.add_argument("--service", default="t2v", choices=["t2v", "omni"])
+    ap.add_argument("--service", default="t2v", choices=["t2v", "omni", "full"])
     ap.add_argument("--n", type=int, default=6)
     ap.add_argument("--width", type=int)
     ap.add_argument("--height", type=int)
@@ -85,7 +85,7 @@ def main() -> None:
             raise SystemExit(f"HTTP {error.code} from {path}: {error.read().decode(errors='replace')[:2000]}")
 
     def submit(prompt: str) -> dict:
-        body = {"model": "fasth3-omni" if omni else "fasth3", "prompt": prompt, "seed": a.seed}
+        body = {"model": {"omni": "fasth3-omni", "full": "minimax-h3"}.get(a.service, "fasth3"), "prompt": prompt, "seed": a.seed}
         for key, value in (("width", a.width), ("height", a.height), ("num_frames", a.frames)):
             if value:
                 body[key] = value

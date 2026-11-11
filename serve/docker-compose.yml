@@ -1,7 +1,8 @@
 # FastH3 (FastVideo's 8-step distillation of MiniMax-H3: text -> 5 s of 1344x768 video with stereo audio) on one GB300,
-# behind FastVideo's OpenAI-style video API. Two services share one port; run one at a time:
+# behind FastVideo's OpenAI-style video API. Three services share one port; run one at a time:
 #   docker compose up -d t2v        text -> video + audio (FastVideo-FastH3-8-Step-V2)
 #   docker compose up -d omni       text + image/video/audio references -> video + audio (FastH3 Omni)
+#   docker compose up -d full       the full 50-step MiniMax-H3 that FastH3 is distilled from (BF16, bit-exact speedups)
 # Profiles (profiles/*.env) switch the lossy speed options:  docker compose --env-file profiles/fast.env up -d t2v
 # Settings and measured effect of every switch: ../README.md.
 name: fasth3
@@ -122,3 +123,17 @@ services:
       # cuDNN fused attention for the encoder, which sees the reference image's vision tokens.
       FASTVIDEO_H3_ENCODER_SDPA: ${OMNI_ENCODER_SDPA-cudnn}
     entrypoint: ["sh", "-c", "/opt/venv/bin/python3 -I /config/with_loras.py /config/fasth3-omni.yaml /loras /tmp/serve.yaml || exit 1; ls /loras/*.safetensors >/dev/null 2>&1 || export FASTVIDEO_H3_LORA_MERGE=0; /opt/venv/bin/fastvideo serve --config /tmp/serve.yaml $$FV_ARGS $$OMNI_ARGS $$TR_ARGS & s=$$!; trap 'kill -TERM $$s; wait $$s' TERM INT; ( [ \"$$FV_WARMUP\" = 1 ] && /opt/venv/bin/python3 -I /config/warmup.py fasth3-omni $$FV_WARMUP_REF ) & wait $$s"]
+
+  full:
+    <<: *common
+    container_name: fasth3-full
+    environment:
+      <<: *common_env
+      # FastVideo's standard MiniMax-H3 path, not the fused one; FV_ARGS, TR_ARGS and the profiles do not apply. What
+      # runs faster here is bit-identical to FastVideo's own path: its exact Triton kernels
+      # (FASTVIDEO_MINIMAX_H3_EXACT_KERNELS, above), attention without the QKV stack copy (patches/), and the q/k
+      # RMSNorm + RoPE in one pass (fastvideo/models/dits/h3exact; FASTVIDEO_H3_EXACT_QK=0 turns it off).
+      FASTVIDEO_H3_FAST: "0"
+      FASTVIDEO_H3_EXACT_QK: ${FULL_EXACT_QK:-1}
+      FASTVIDEO_H3_LORA_MERGE: "0"
+    entrypoint: ["sh", "-c", "exec /opt/venv/bin/fastvideo serve --config /config/minimax-h3-full.yaml"]

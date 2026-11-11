@@ -1,0 +1,44 @@
+# MiniMax-H3, the full 50-step model FastH3 is distilled from (text -> 5 s of 1344x768 video with stereo audio), on one
+# GB300. FastVideo's standard path as in its examples/inference/basic/basic_minimax_h3_t2v.py: BF16, full attention,
+# 50 steps, guidance 1.0, with this repository's bit-exact speedups (README, "The full model"). Everything stays on the
+# GPU: transformer 62 GB + text encoder 63 GB + VAEs 10 GB.
+generator:
+  model_path: /root/.cache/huggingface/hub/models--MiniMaxAI--MiniMax-H3/snapshots/42ed227ee7df40d41602854ae760620d6eb651fe
+  engine:
+    num_gpus: 1
+    use_fsdp_inference: false
+    parallelism:
+      tp_size: 1
+      sp_size: 1
+    offload:
+      dit: false
+      dit_layerwise: false
+      text_encoder: false
+      image_encoder: false
+      vae: false
+      pin_cpu_memory: true
+    compile:
+      enabled: false
+      vae_enabled: false
+  pipeline:
+    workload_type: t2v
+
+server:
+  host: 0.0.0.0
+  port: 8101
+  media_roots: [/media]
+  output_dir: /media/out/minimax-h3
+  served_model_name: minimax-h3
+
+default_request:
+  negative_prompt: ""
+  sampling:
+    height: 768
+    width: 1344
+    num_frames: 124
+    fps: 24
+    num_inference_steps: 50
+    guidance_scale: 1.0
+    seed: 1000
+  output:
+    return_frames: false

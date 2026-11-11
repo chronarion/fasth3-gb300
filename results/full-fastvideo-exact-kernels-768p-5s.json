@@ -1,0 +1,30 @@
+{
+  "label": "fastvideo-exact-kernels-768p-5s",
+  "service": "full",
+  "size": "server default",
+  "frames": "server default",
+  "prompt": "short",
+  "lora": null,
+  "first_s": 170.33,
+  "done_s": 133.014,
+  "fetched_s": 133.022,
+  "pipeline_s": 132.893,
+  "runs_done": [
+    132.79,
+    144.95,
+    133.01
+  ],
+  "stages_ms": {
+    "input_preparation_stage": 0.0,
+    "conditioning_stage": 56.7,
+    "latent_preparation_stage": 25.1,
+    "denoising_stage": 131496.6,
+    "video_decoding_stage": 1033.2,
+    "audio_decoding_stage": 62.2
+  },
+  "samples": [
+    "/media/out/minimax-h3/videos/video_gen_820a7f9209dc4f72b30915adc182b9df.mp4",
+    "/media/out/minimax-h3/videos/video_gen_53578014a7244f16911ff996e5141f5b.mp4",
+    "/media/out/minimax-h3/videos/video_gen_08e7231ecf85448097b835dbd922c065.mp4"
+  ]
+}

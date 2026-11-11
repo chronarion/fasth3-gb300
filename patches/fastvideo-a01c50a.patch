@@ -1,3 +1,32 @@
+diff --git a/fastvideo/attention/layer.py b/fastvideo/attention/layer.py
+index a64c6d6..29ea0ae 100644
+--- a/fastvideo/attention/layer.py
++++ b/fastvideo/attention/layer.py
+@@ -6,7 +6,7 @@ import torch
+ import torch.nn as nn
+ 
+ import fastvideo.envs as envs
+-from fastvideo.attention.backends.abstract import AttentionMetadata
++from fastvideo.attention.backends.abstract import AttentionImpl, AttentionMetadata
+ from fastvideo.attention.selector import backend_name_to_enum, get_attn_backend
+ from fastvideo.distributed.communication_op import (sequence_model_parallel_all_gather,
+                                                     sequence_model_parallel_all_to_all_4D)
+@@ -136,6 +136,15 @@ class DistributedAttention(nn.Module):
+         """
+         # Check input shapes
+         assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "Expected 4D tensors"
++        # One GPU, no rotary or replicated tokens, a backend without pre/post-processing: forward_stacked would only
++        # stack, chunk and pad by zero rows, so call the backend on q, k, v as they are (no QKV copy, no output clone)
++        if (get_sp_world_size() == 1 and freqs_cis is None and replicated_q is None
++                and original_seq_len in (None, q.shape[1])
++                and type(self.attn_impl).preprocess_qkv is AttentionImpl.preprocess_qkv
++                and type(self.attn_impl).postprocess_output is AttentionImpl.postprocess_output):
++            forward_context: ForwardContext = get_forward_context()
++            ctx_attn_metadata = attn_metadata if attn_metadata is not None else forward_context.attn_metadata
++            return self.attn_impl.forward(q, k, v, ctx_attn_metadata), None
+         # Stack QKV
+         qkv = torch.cat([q, k, v], dim=0)  # [3*batch, seq_len, num_heads, head_dim]
+         return self.forward_stacked(
 diff --git a/fastvideo/entrypoints/openai/serving_engine.py b/fastvideo/entrypoints/openai/serving_engine.py
 index 5717151..7bfad66 100644
 --- a/fastvideo/entrypoints/openai/serving_engine.py
@@ -447,10 +476,18 @@ index 5198b92..b6a0768 100644
 +    "quantize_fp8_weight",
  ]
 diff --git a/fastvideo/models/dits/minimax_h3.py b/fastvideo/models/dits/minimax_h3.py
-index 06ad52e..388c22f 100644
+index 06ad52e..3723fcf 100644
 --- a/fastvideo/models/dits/minimax_h3.py
 +++ b/fastvideo/models/dits/minimax_h3.py
-@@ -38,6 +38,8 @@ from fastvideo.logger import init_logger
+@@ -18,6 +18,7 @@ from fastvideo.attention import DistributedAttention
+ from fastvideo.attention.backends.abstract import AttentionMetadata, layer_idx_from_prefix
+ from fastvideo.attention.backends.video_sparse_attn_h3 import MiniMaxH3VSAMetadata
+ from fastvideo.attention.layer import DistributedAttention_VSA
++from fastvideo.models.dits.h3exact import try_qknorm_rope
+ from fastvideo.attention.selector import get_attn_backend
+ from fastvideo.attention.utils.nvfp4_qk_precondition import parse_block_indices
+ from fastvideo.configs.models.dits.minimax_h3 import MiniMaxH3Config
+@@ -38,6 +39,8 @@ from fastvideo.logger import init_logger
  from fastvideo.models.dits.base import BaseDiT
  from fastvideo.models.dits.minimax_h3_vsa_fp4 import (STAGES, vsa_fp4_attention, vsa_fp4_attention_sp,
                                                         vsa_fp4_requested, vsa_tile_first_attention)
@@ -459,7 +496,16 @@ index 06ad52e..388c22f 100644
  from fastvideo.models.dits.minimax_h3_fusions import exact as exact_kernels
  from fastvideo.models.dits.minimax_h3_fusions import mk as mk_kernels
  from fastvideo.models.dits.minimax_h3_fusions import (
-@@ -967,6 +969,7 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -447,6 +450,8 @@ class MiniMaxH3Attention(nn.Module):
+                 return hidden_states
+             query = fused_qknorm_rope(query, self.norm_q.weight, cos, sin, self.norm_q.eps)
+             key = fused_qknorm_rope(key, self.norm_k.weight, cos, sin, self.norm_k.eps)
++        elif self.exact_rope and try_qknorm_rope(query, key, self.norm_q, self.norm_k, rotary_emb):
++            pass  # q/k RMSNorm + RoPE prefix in one bit-exact pass, in place (h3exact)
+         else:
+             query = self.norm_q(query)
+             key = self.norm_k(key)
+@@ -967,6 +972,7 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
          # per-generation caches for loop-invariant work (see _rotary_for /
          # _refined_text); plain attrs, never in state_dict
          self._rope_cache: tuple | None = None
@@ -467,7 +513,7 @@ index 06ad52e..388c22f 100644
          self._text_cache: tuple | None = None
          self.token_refiner = MiniMaxH3TokenRefiner(
              arch.hidden_size,
-@@ -1229,24 +1232,61 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1229,24 +1235,61 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
                                   (2 * arch.rope_freq_dim)))
              self.rope._buffers["inv_freq"] = inv_freq
  
@@ -533,7 +579,7 @@ index 06ad52e..388c22f 100644
      def attach_step_splice(self, late: nn.Module, from_step: int) -> None:
          """Hand denoising steps ``from_step`` onward to ``late`` (same architecture, other weights).
  
-@@ -1326,6 +1366,84 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1326,6 +1369,84 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
              self._text_cache = (encoder_hidden_states, text_embeds, text_attn_metadata)
          return text_embeds
  
@@ -618,7 +664,7 @@ index 06ad52e..388c22f 100644
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -1339,13 +1457,18 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1339,13 +1460,18 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
          audio_indices: torch.Tensor,
          text_indices: torch.Tensor,
          text_attn_metadata: AttentionMetadata | None = None,
@@ -639,7 +685,7 @@ index 06ad52e..388c22f 100644
          if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
              raise ValueError(f"position_ids must have shape (seq_len, 3), got {tuple(position_ids.shape)}.")
          sequence_length = position_ids.shape[0]
-@@ -1357,6 +1480,15 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1357,6 +1483,15 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
              raise ValueError("audio_hidden_states row count must match audio_indices.")
          if encoder_hidden_states.shape[1] != text_indices.numel():
              raise ValueError("encoder_hidden_states row count must match text_indices.")
@@ -655,7 +701,7 @@ index 06ad52e..388c22f 100644
  
          video_embeds, _ = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
          audio_embeds, _ = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.weight.dtype))
-@@ -1371,6 +1503,8 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1371,6 +1506,8 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
          pad_tokens = sequence_length - real_tokens
          if pad_tokens < 0:
              raise ValueError("Real H3 token counts exceed the packed sequence length")
@@ -664,7 +710,7 @@ index 06ad52e..388c22f 100644
          if pad_tokens:
              metadata = get_forward_context().attn_metadata
              packed_sequence = getattr(metadata, "packed_sequence", None)
-@@ -1391,6 +1525,12 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1391,6 +1528,12 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
          adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags
          local_timestep_indices = timestep_indices
          original_seq_len = sequence_length
@@ -677,7 +723,7 @@ index 06ad52e..388c22f 100644
  
          if sp_world_size > 1:
              packed_hidden_states = self._block_input(sequence_model_parallel_shard(packed_hidden_states, dim=1)[0])
-@@ -1399,6 +1539,10 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1399,6 +1542,10 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
              adaln_indices, _ = sequence_model_parallel_shard(adaln_indices, dim=0)
              local_timestep_indices, _ = sequence_model_parallel_shard(local_timestep_indices, dim=0)
              rotary_emb = (rotary_cos, rotary_sin)
@@ -688,7 +734,7 @@ index 06ad52e..388c22f 100644
  
          if getattr(self, "_adaln_host_cache", False):
              # One host read per forward keys every block's modulation cache by the timestep values.
-@@ -1407,20 +1551,14 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
+@@ -1407,20 +1554,14 @@ class MiniMaxH3Transformer3DModel(BaseDiT):
                  block.adaln_proj._cache_key = key
              self._move_adaln_tables(temb.device)
  

@@ -16,6 +16,10 @@ FastH3 Omni, which also takes reference images, video or audio, takes 18.74 s pe
 15.25 s. When requests queue up, a new 5-second clip finishes every **11.40 s** (5.3 per minute;
 see [Clips back to back](#clips-back-to-back)).
 
+The server can also run the original MiniMax-H3 that FastH3 is distilled from: 50 steps at full 16-bit precision.
+A 5-second clip takes **125.7 s** instead of FastVideo's 154.8 s on the same GPU, and the video file is identical
+bit for bit (see [The full MiniMax-H3 model](#the-full-minimax-h3-model)).
+
 At 832×480 (480p) a 5-second clip takes **3.92 s** (**2.69 s** with `max`), and at 640×640, the size
 ComfyUI's FastH3 template uses by default, 3.76 s (2.50 s). For comparison, a published run of
 ComfyUI's official FastH3 template on an RTX 5090 home GPU took 18.7 s for the same 5-second 832×480 clip and
@@ -26,6 +30,7 @@ ComfyUI's official FastH3 template on an RTX 5090 home GPU took 18.7 s for the s
 - [How the server is set up](#how-the-server-is-set-up)
 - [Differences from ComfyUI's FastH3 workflow](#differences-from-comfyuis-fasth3-workflow)
 - [What makes it fast](#what-makes-it-fast)
+- [The full MiniMax-H3 model](#the-full-minimax-h3-model): the 50-step original, faster with identical output
 - [Quick start](#quick-start), [Measuring](#measuring), [Notes](#notes), [Glossary](#glossary), [Credits](#credits)
 
 ## Results
@@ -192,7 +197,7 @@ its time per video divided by the video's length. Over the same mix:
 - **Software:** NVIDIA driver 615, CUDA 13.0, PyTorch 2.12.0, FastVideo `a01c50a`, FlashAttention-4 4.0.0b36,
   FlashInfer 0.7.4rc1, cuDNN 9.20 (the Docker image this repository builds).
 - **Model versions:** FastVideo-FastH3-8-Step-V2 `3da2ddf`, FastH3-QAD-v2 `a0dc05a`, FastH3-Omni-8-Step-V1 `53e0d26`,
-  FastH3-Omni-NVFP4-QAD `f01e6a2`, FastH3-NVFP4-VAE-Decoder `bd0c248`.
+  FastH3-Omni-NVFP4-QAD `f01e6a2`, FastH3-NVFP4-VAE-Decoder `bd0c248`, MiniMax-H3 `42ed227`.
 - **Requests:** the four short prompts are in `tools/bench.py`, the two long ones (956 and 9,771 tokens) in
   `tools/prompts/`. Each long-prompt clip gets a different "Take N." prefix so no clip can reuse another's work. Omni
   requests carry one 1344×768 reference image, processed again for every clip unless the row says "same reference
@@ -201,7 +206,8 @@ its time per video divided by the video's length. Over the same mix:
   untimed clip, with seed 1234. The benchmark repeats its four short prompts, so the prompt cache is off for every
   row except the re-roll rows. Back-to-back rows submit the timed clips together after the untimed one and report
   the median time between consecutive finished clips (`tools/bench.py --back-to-back`).
-- **Which release:** every row was measured with release 1.5.
+- **Which release:** every row was measured with release 1.5, except the full-model rows (release 1.6; the FastH3
+  services give the same files at the same speed in both).
 - **What is timed:** *total* runs from the request until the server has written the MP4 file. *Downloaded* also
   includes downloading the file. *Without making the MP4* covers reading the prompt, generating the video and decoding
   it, but not writing the video file.
@@ -394,6 +400,42 @@ batch, its 4-bit quality decoder, 8-bit model math and a compiled video decoder.
 
 </details>
 
+## The full MiniMax-H3 model
+
+FastH3 is a distilled version of [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), which takes 50 steps per
+clip and runs at full 16-bit precision. The `full` service runs that original model with FastVideo's standard code
+and three changes that make it faster without changing a single bit of the result: the same request and seed give
+the same MP4 file, byte for byte.
+
+5-second 1344×768 clip with sound, short prompts, one GB300; median of 3 timed clips after one untimed clip (2 for
+FastVideo's standard path), records in `results/full-*.json`. In some runs one of the three clips took about 12 s
+longer, with 1.5 and 1.6 alike and with identical output; it did not come back in later runs.
+
+| Software | Total | Without making the MP4 |
+|---|---:|---:|
+| FastVideo `a01c50a`, standard path | 154.8 s | 154.7 s |
+| FastVideo with its exact combined GPU steps (`FASTVIDEO_MINIMAX_H3_EXACT_KERNELS=all`, this repository's 1.5) | 133.0 s | 132.9 s |
+| This repository, 1.6 | **125.7 s** | **125.6 s** |
+| Published: NVIDIA's [Sol-H3 page](https://nvlabs.github.io/Sana/Sol-Engine/Sol-H3/), one B300, base H3, 50 steps, dense attention | | 129.9 s |
+
+What changed, each one checked to give bit-identical results:
+
+| Change | Effect |
+|---|---|
+| **FastVideo's exact combined GPU steps** for rotation, modulation, residual and SwiGLU, which FastVideo ships switched off; this repository's server already switched them on for FastH3 | 154.8 → 133.0 s |
+| **Attention without copies.** On one GPU, FastVideo stacked q, k and v into one new array and padded it before attention; now the attention code gets them as they are (`patches/`) | ~1.5 s per clip |
+| **Normalization and rotation in one pass.** The per-head RMSNorm of q and k and the rotary position step ran as four passes over memory; one new GPU program does all of it and reproduces PyTorch's arithmetic bit for bit (`fastvideo/models/dits/h3exact/`, `tests/test_qknorm_rope.py`) | 3.46 → 0.90 ms per block, ~6 s per clip |
+
+How we checked it: the same prompts rendered by FastVideo's standard path, by 1.5 and by 1.6 gave the same MP4
+checksums (3 clips on the standard path, 4 on 1.5 and 1.6), and before that every step of four clips was compared with a recording of the standard path (all 196
+equal). The fast FastH3 services are unchanged by 1.6 (same MP4 files, same times).
+
+- Start it with `docker compose up -d full` after `tools/download_models.sh full` (about 134 GB). Requests use
+  `"model": "minimax-h3"`; the presets, profiles and LoRA folding of the FastH3 services do not apply.
+- The whole model stays on the GPU: about 135 GB plus the working memory of one clip.
+- The first clip after the server starts takes longer: about 131 s once the GPU code is compiled, about 285 s on the
+  very first start while it compiles (kept in `serve/cache` after that).
+
 ## Quick start
 
 You need a GB300 (the custom GPU code uses features only it has), Docker set up to give containers a specific GPU
@@ -444,7 +486,7 @@ it. LoRAs are third-party weights with their own licenses.
 
 ## Measuring
 
-**Speed:** run `tools/bench.py LABEL` against a running server (options: `--service omni --ref /media/in/<image>`,
+**Speed:** run `tools/bench.py LABEL` against a running server (options: `--service omni --ref /media/in/<image>`, `--service full`,
 `--width W --height H --frames N`, `--prompt-file F`). It prints the median times and the time of each step.
 `tools/baselines/` has the two FastVideo-only setups used above.
 
@@ -453,7 +495,9 @@ it. LoRAs are third-party weights with their own licenses.
 The error numbers above compare against FastVideo's full-precision path (`FASTVIDEO_H3_FAST=0`,
 `FV_ARGS="--generator.engine.compile.vae_enabled true"`, and for Omni also `OMNI_ARGS=`).
 
-**GPU code:** `tests/test_kernels.py` checks each custom GPU program against plain PyTorch.
+**GPU code:** `tests/test_kernels.py` checks each custom GPU program against plain PyTorch;
+`tests/test_qknorm_rope.py` checks that the full model's combined normalization and rotation step matches PyTorch
+bit for bit.
 
 ## Notes
 
